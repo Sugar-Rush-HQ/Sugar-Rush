@@ -6,14 +6,16 @@ import datetime
 import os
 import aiohttp
 import math
-from pymongo import MongoClient
+import random
+import string
+import io
+from pymongo import MongoClient, ReturnDocument
 
 # --- 1. CONFIGURATION ---
 
 # Environment Variables
 BOT_TOKEN = os.environ.get("DISCORD_TOKEN")
 MONGO_URI = os.environ.get("MONGO_URI")
-SELLAPP_API_KEY = os.environ.get("SELLAPP_API_KEY")
 
 # --- ROLE IDs ---
 COOK_ROLE_ID = 1454877400729911509
@@ -25,6 +27,10 @@ OWNER_ID = 662655499811946536
 SENIOR_COOK_ROLE_ID = 0
 SENIOR_DELIVERY_ROLE_ID = 0
 QUOTA_BYPASS_ROLE_ID = 0 
+
+# Support Server VIP (REPLACE 0 WITH ACTUAL IDs)
+SUPPORT_SERVER_ID = 0     
+VIP_ROLE_ID = 0           
 
 # --- CHANNEL IDs ---
 COOK_CHANNEL_ID = 1454879418999767122       # Kitchen
@@ -49,6 +55,7 @@ try:
     scripts_col = db["scripts"]
     premium_col = db["premium_users"]
     vacations_col = db["vacations"]
+    codes_col = db["premium_codes"] 
     config_col = db["config"] 
     print("✅ Connected to MongoDB.")
 except Exception as e:
@@ -135,28 +142,6 @@ async def update_master_log(order_id):
                 orders_col.update_one({"order_id": order_id}, {"$set": {"backup_msg_id": msg.id}})
             except: pass
 
-async def verify_sellapp_license(key, discord_id):
-    url = f"https://sell.app/api/v1/licenses/{key}"
-    headers = {"Authorization": f"Bearer {SELLAPP_API_KEY}"}
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url, headers=headers) as resp:
-            if resp.status != 200: return False, "Invalid Key or API Error"
-            data = await resp.json()
-            license_data = data.get('data', {})
-            existing_hwid = license_data.get('hardware_id')
-            if existing_hwid and existing_hwid != str(discord_id): return False, "Key already bound."
-        if not existing_hwid:
-            update_url = f"https://sell.app/api/v1/licenses/{key}"
-            payload = {"hardware_id": str(discord_id)}
-            async with session.put(update_url, json=payload, headers=headers) as update_resp:
-                if update_resp.status != 200: return False, "Failed to bind license."
-        variant = license_data.get('variant', {}).get('title', '').lower()
-        days = 30
-        if "1 day" in variant: days = 1
-        elif "week" in variant: days = 7
-        elif "year" in variant: days = 365
-        return True, days
-
 def calculate_quota_target(staff_count):
     if staff_count <= 0: return 5
     target = math.ceil(5 / staff_count)
@@ -171,6 +156,11 @@ def calculate_dynamic_targets(total_volume, staff_count):
         normal_target = max(1, normal_target)
         senior_target = max(1, senior_target)
     return normal_target, senior_target
+
+def generate_key_string():
+    """Generates a random key like VIP-A1B2-C3D4"""
+    def seg(): return ''.join(random.choices(string.ascii_uppercase + string.digits, k=4))
+    return f"VIP-{seg()}-{seg()}-{seg()}"
 
 # --- 5. UI CLASSES (Vacation) ---
 
@@ -194,13 +184,10 @@ class VacationEditModal(discord.ui.Modal, title="Edit Vacation Duration"):
                 {"$set": {"status": "active", "end_date": end_date}},
                 upsert=True
             )
-            
             role = interaction.guild.get_role(QUOTA_BYPASS_ROLE_ID)
             if role: await self.target_user.add_roles(role)
-
             timestamp = int(end_date.timestamp())
             
-            # Update Embed
             embed = self.original_message.embeds[0]
             embed.color = discord.Color.green()
             embed.set_field_at(1, name="Duration", value=f"{new_days} Days (Edited)", inline=True)
@@ -208,10 +195,8 @@ class VacationEditModal(discord.ui.Modal, title="Edit Vacation Duration"):
             
             await self.original_message.edit(embed=embed, view=None)
             await interaction.response.send_message(f"✅ Modified & Approved for **{new_days} days**.", ephemeral=True)
-            
             try: await self.target_user.send(f"🌴 **Vacation Approved (Modified)!**\nDuration: {new_days} days\nEnds: <t:{timestamp}:R>")
             except: pass
-
         except ValueError:
             await interaction.response.send_message("❌ Invalid number.", ephemeral=True)
 
@@ -228,10 +213,8 @@ class VacationDenyModal(discord.ui.Modal, title="Deny Vacation Request"):
         embed.color = discord.Color.red()
         embed.add_field(name="Denial Reason", value=self.reason.value, inline=False)
         embed.set_footer(text=f"Denied by {interaction.user.display_name}")
-        
         await self.original_message.edit(embed=embed, view=None)
         await interaction.response.send_message("❌ Request Denied.", ephemeral=True)
-        
         try: await self.target_user.send(f"❌ **Vacation Request Denied**\n**Reason:** {self.reason.value}")
         except: pass
 
@@ -244,17 +227,14 @@ class VacationView(discord.ui.View):
     @discord.ui.button(label="Approve", style=discord.ButtonStyle.green, custom_id="vac_approve")
     async def approve(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not is_manager(interaction.user): return await interaction.response.send_message("❌ Managers only.", ephemeral=True)
-        
         end_date = datetime.datetime.utcnow() + datetime.timedelta(days=self.days)
         vacations_col.update_one(
             {"user_id": str(self.target_user.id)},
             {"$set": {"status": "active", "end_date": end_date}},
             upsert=True
         )
-        
         role = interaction.guild.get_role(QUOTA_BYPASS_ROLE_ID)
         if role: await self.target_user.add_roles(role)
-        
         timestamp = int(end_date.timestamp())
         
         embed = interaction.message.embeds[0]
@@ -264,7 +244,6 @@ class VacationView(discord.ui.View):
         self.clear_items()
         await interaction.message.edit(embed=embed, view=self)
         await interaction.response.send_message(f"✅ Approved for {self.days} days.", ephemeral=True)
-        
         try: await self.target_user.send(f"🌴 **Vacation Approved!**\nEnds: <t:{timestamp}:R>")
         except: pass
 
@@ -299,6 +278,13 @@ async def check_premium_expiry():
     expired = premium_col.find({"is_vip": True, "expires_at": {"$lt": now}})
     for u in expired:
         premium_col.update_one({"user_id": u['user_id']}, {"$set": {"is_vip": False}, "$unset": {"expires_at": ""}})
+        try:
+            support_guild = bot.get_guild(SUPPORT_SERVER_ID)
+            if support_guild:
+                member = support_guild.get_member(int(u['user_id']))
+                role = support_guild.get_role(VIP_ROLE_ID)
+                if member and role: await member.remove_roles(role)
+        except: pass
 
 @tasks.loop(minutes=60)
 async def check_vacations():
@@ -351,8 +337,6 @@ async def auto_delivery_task():
                     if dc: await dc.send(f"🤖 **Auto-Delivered** `{o['order_id']}`.")
         except Exception: pass
 
-# --- WEEKLY QUOTA TASK ---
-
 async def run_quota_logic(guild):
     quota_channel = bot.get_channel(QUOTA_CHANNEL_ID)
     if not quota_channel: return
@@ -363,10 +347,8 @@ async def run_quota_logic(guild):
     cooks = cook_role.members if cook_role else []
     deliverers = deliver_role.members if deliver_role else []
 
-    total_cook_volume = sum([users_col.find_one({"user_id": str(m.id)}) \
-                            .get("cook_count_week", 0) if users_col.find_one({"user_id": str(m.id)}) else 0 \
-                            for m in cooks])
-    
+    total_cook_volume = sum([users_col.find_one({"user_id": str(m.id)}).get("cook_count_week", 0) 
+                             if users_col.find_one({"user_id": str(m.id)}) else 0 for m in cooks])
     total_deliver_volume = sum([users_col.find_one({"user_id": str(m.id)}).get("deliver_count_week", 0) 
                                 if users_col.find_one({"user_id": str(m.id)}) else 0 for m in deliverers])
 
@@ -466,7 +448,72 @@ async def weekly_quota_check():
             await run_quota_logic(guild)
         config_col.update_one({"key": "last_quota_run"}, {"$set": {"date": now}}, upsert=True)
 
-# --- 7. COMMANDS ---
+# --- 7. NEW COMMANDS (GENERATE CODES & REDEEM) ---
+
+@bot.tree.command(name="generate_codes", description="Generate premium codes (Owner Only)")
+async def generate_codes(interaction: discord.Interaction, amount: int):
+    # OWNER ONLY CHECK
+    if interaction.user.id != OWNER_ID:
+        return await interaction.response.send_message("❌ Owner only.", ephemeral=True)
+    
+    if amount < 1 or amount > 50:
+        return await interaction.response.send_message("❌ Please generate between 1 and 50 codes at a time.", ephemeral=True)
+
+    generated_codes = []
+    for _ in range(amount):
+        new_code = generate_key_string()
+        codes_col.insert_one({
+            "code": new_code,
+            "status": "unused",
+            "duration_days": 30,
+            "created_at": datetime.datetime.utcnow(),
+            "created_by": str(interaction.user.id)
+        })
+        generated_codes.append(new_code)
+
+    code_text = "\n".join(generated_codes)
+    file = discord.File(io.StringIO(code_text), filename="premium_codes.txt")
+    
+    await interaction.response.send_message(f"✅ Generated {amount} codes.", file=file, ephemeral=True)
+
+@bot.tree.command(name="redeem", description="Redeem a Premium Code (30 Days)")
+async def redeem(interaction: discord.Interaction, code: str):
+    await interaction.response.defer(ephemeral=True)
+    
+    # Atomic Check-and-Set to ensure 1-time use
+    code_data = codes_col.find_one_and_update(
+        {"code": code, "status": "unused"},
+        {"$set": {
+            "status": "redeemed",
+            "redeemed_by": str(interaction.user.id),
+            "redeemed_at": datetime.datetime.utcnow()
+        }},
+        return_document=ReturnDocument.AFTER
+    )
+    
+    if not code_data:
+        return await interaction.followup.send("❌ Invalid or used code.", ephemeral=True)
+    
+    # Grant Premium (30 Days from NOW)
+    expiry = datetime.datetime.utcnow() + datetime.timedelta(days=30)
+    premium_col.update_one(
+        {"user_id": str(interaction.user.id)}, 
+        {"$set": {"is_vip": True, "expires_at": expiry, "redeemed_code": code}}, 
+        upsert=True
+    )
+    
+    try:
+        support_guild = bot.get_guild(SUPPORT_SERVER_ID)
+        if support_guild:
+            member = support_guild.get_member(interaction.user.id)
+            role = support_guild.get_role(VIP_ROLE_ID)
+            if member and role:
+                await member.add_roles(role)
+    except: pass
+
+    await interaction.followup.send(f"💎 **Premium Activated!** Valid for 30 days.", ephemeral=True)
+
+# --- 8. OTHER COMMANDS ---
 
 @bot.tree.command(name="help", description="Show available commands")
 async def help(interaction: discord.Interaction):
@@ -482,7 +529,7 @@ async def help(interaction: discord.Interaction):
         "`/order <item>` - Place a new order\n"
         "`/rate <id> <1-5>` - Rate a delivered order\n"
         "`/complain <id> <reason>` - Report an issue\n"
-        "`/redeem <key>` - Activate Premium\n"
+        "`/redeem <code>` - Activate Premium\n"
         "`/rules` - View server rules"
     )
     embed.add_field(name="🧑‍🍳 Customer Menu", value=customer_cmds, inline=False)
@@ -522,7 +569,8 @@ async def help(interaction: discord.Interaction):
     if is_owner:
         owner_cmds = (
             "`/addvip <user>` - Gift VIP status\n"
-            "`/removevip <user>` - Revoke VIP status"
+            "`/removevip <user>` - Revoke VIP status\n"
+            "`/generate_codes <amount>` - Create premium keys"
         )
         embed.add_field(name="👑 Owner", value=owner_cmds, inline=False)
 
@@ -639,6 +687,17 @@ async def redeem(interaction: discord.Interaction, license_key: str):
     expiry = datetime.datetime.utcnow() + datetime.timedelta(days=result)
     premium_col.update_one({"user_id": str(interaction.user.id)}, 
                            {"$set": {"is_vip": True, "expires_at": expiry, "license_key": license_key}}, upsert=True)
+    
+    # 🆕 ASSIGN VIP ROLE IN SUPPORT SERVER
+    try:
+        support_guild = bot.get_guild(SUPPORT_SERVER_ID)
+        if support_guild:
+            member = support_guild.get_member(interaction.user.id)
+            role = support_guild.get_role(VIP_ROLE_ID)
+            if member and role:
+                await member.add_roles(role)
+    except: pass
+
     await interaction.followup.send(f"💎 **Premium Activated!** Valid for {result} days.", ephemeral=True)
 
 @bot.tree.command(name="order", description="Place an order")
@@ -696,16 +755,6 @@ async def complain(interaction: discord.Interaction, order_id: str, reason: str)
     lc = bot.get_channel(COMPLAINT_CHANNEL_ID)
     if lc: await lc.send(f"🚨 **Complaint** `{order_id}`\nUser: <@{o['user_id']}>\nMsg: {reason}")
     await interaction.response.send_message("Sent to management.", ephemeral=True)
-
-@bot.tree.command(name="rules", description="View rules")
-async def rules(interaction: discord.Interaction):
-    embed = discord.Embed(title="🍩 Discord Donuts Rules", color=discord.Color.gold())
-    embed.add_field(name="1. The Golden Rule", value="**Every order MUST include a donut.**", inline=False)
-    embed.add_field(name="2. Conduct", value="No NSFW.", inline=False)
-    embed.add_field(name="3. Queue", value="1 Active order at a time.", inline=False)
-    embed.add_field(name="4. Quantity", value="**Max of 3 Items per order.**", inline=False)
-    embed.set_footer(text="Violations result in bans. Bans are appealable via Ticket/Email.")
-    await interaction.response.send_message(embed=embed)
 
 @bot.tree.command(name="orderlist", description="View Queue")
 async def orderlist(interaction: discord.Interaction):
