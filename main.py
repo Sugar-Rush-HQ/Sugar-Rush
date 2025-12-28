@@ -17,6 +17,12 @@ from pymongo import MongoClient, ReturnDocument
 BOT_TOKEN = os.environ.get("DISCORD_TOKEN")
 MONGO_URI = os.environ.get("MONGO_URI")
 
+# --- BRANDING ---
+BRAND_NAME = "Sugar Rush"
+BRAND_COLOR = discord.Color.orange()  # Rebranded to Orange
+SUPPORT_EMAIL = "help@sugarrush.gg"
+SUPPORT_SERVER_LINK = "https://discord.gg/ceT3Gqwquj"
+
 # --- ROLE IDs ---
 COOK_ROLE_ID = 1454877400729911509
 DELIVERY_ROLE_ID = 1454877287953469632
@@ -41,10 +47,6 @@ COMPLAINT_CHANNEL_ID = 1454886383662665972  # User Complaints
 BACKUP_CHANNEL_ID = 1454888266451910901     # Master Log
 QUOTA_CHANNEL_ID = 1454895987322519672      # Quota Reports
 VACATION_CHANNEL_ID = 1454909580894015754   # Vacation Requests
-
-# --- LINKS & CONTACT ---
-SUPPORT_SERVER_LINK = "https://discord.gg/ceT3Gqwquj"
-SUPPORT_EMAIL = "support@discorddonuts.com"
 
 # --- 2. DATABASE CONNECTION ---
 try:
@@ -105,7 +107,7 @@ async def update_master_log(order_id):
 
     status_map = {
         "pending": ("⬜ PENDING", discord.Color.light_grey()),
-        "claimed": ("✋ CLAIMED", discord.Color.gold()),
+        "claimed": ("✋ CLAIMED", BRAND_COLOR),
         "cooking": ("👨‍🍳 COOKING", discord.Color.orange()),
         "ready": ("📦 READY", discord.Color.green()),
         "delivered": ("🚴 DELIVERED", discord.Color.blue()),
@@ -114,7 +116,7 @@ async def update_master_log(order_id):
     }
     status_text, color = status_map.get(o['status'], ("UNKNOWN", discord.Color.default()))
     
-    embed = discord.Embed(title=f"🍩 Order #{order_id}", color=color)
+    embed = discord.Embed(title=f"🍩 {BRAND_NAME} Order #{order_id}", color=color)
     embed.add_field(name="Status", value=f"**{status_text}**", inline=True)
     embed.add_field(name="Item", value=o['item'], inline=True)
     embed.add_field(name="Client", value=f"<@{o['user_id']}>", inline=True)
@@ -261,7 +263,7 @@ class VacationView(discord.ui.View):
 
 @bot.event
 async def on_ready():
-    print(f'🍩 Discord Donuts is online as {bot.user}')
+    print(f'🍩 {BRAND_NAME} is online as {bot.user}')
     if not auto_delivery_task.is_running(): auto_delivery_task.start()
     if not auto_unclaim_task.is_running(): auto_unclaim_task.start()
     if not check_premium_expiry.is_running(): check_premium_expiry.start()
@@ -349,6 +351,7 @@ async def run_quota_logic(guild):
 
     total_cook_volume = sum([users_col.find_one({"user_id": str(m.id)}).get("cook_count_week", 0) 
                              if users_col.find_one({"user_id": str(m.id)}) else 0 for m in cooks])
+    
     total_deliver_volume = sum([users_col.find_one({"user_id": str(m.id)}).get("deliver_count_week", 0) 
                                 if users_col.find_one({"user_id": str(m.id)}) else 0 for m in deliverers])
 
@@ -523,7 +526,7 @@ async def help(interaction: discord.Interaction):
     user_is_manager = is_manager(interaction.user)
     is_owner = interaction.user.id == OWNER_ID
 
-    embed = discord.Embed(title="🍩 Discord Donuts Help Menu", color=discord.Color.gold())
+    embed = discord.Embed(title=f"🍩 {BRAND_NAME} Help Menu", color=BRAND_COLOR)
     
     customer_cmds = (
         "`/order <item>` - Place a new order\n"
@@ -679,27 +682,6 @@ async def runquota(interaction: discord.Interaction):
     await run_quota_logic(interaction.guild)
     await interaction.followup.send("✅ Quota check executed. Check the quota log channel.")
 
-@bot.tree.command(name="redeem", description="Redeem a Premium Key from Sell.app")
-async def redeem(interaction: discord.Interaction, license_key: str):
-    await interaction.response.defer(ephemeral=True)
-    success, result = await verify_sellapp_license(license_key, interaction.user.id)
-    if not success: return await interaction.followup.send(f"❌ {result}", ephemeral=True)
-    expiry = datetime.datetime.utcnow() + datetime.timedelta(days=result)
-    premium_col.update_one({"user_id": str(interaction.user.id)}, 
-                           {"$set": {"is_vip": True, "expires_at": expiry, "license_key": license_key}}, upsert=True)
-    
-    # 🆕 ASSIGN VIP ROLE IN SUPPORT SERVER
-    try:
-        support_guild = bot.get_guild(SUPPORT_SERVER_ID)
-        if support_guild:
-            member = support_guild.get_member(interaction.user.id)
-            role = support_guild.get_role(VIP_ROLE_ID)
-            if member and role:
-                await member.add_roles(role)
-    except: pass
-
-    await interaction.followup.send(f"💎 **Premium Activated!** Valid for {result} days.", ephemeral=True)
-
 @bot.tree.command(name="order", description="Place an order")
 async def order(interaction: discord.Interaction, item: str):
     uid = str(interaction.user.id)
@@ -755,6 +737,16 @@ async def complain(interaction: discord.Interaction, order_id: str, reason: str)
     lc = bot.get_channel(COMPLAINT_CHANNEL_ID)
     if lc: await lc.send(f"🚨 **Complaint** `{order_id}`\nUser: <@{o['user_id']}>\nMsg: {reason}")
     await interaction.response.send_message("Sent to management.", ephemeral=True)
+
+@bot.tree.command(name="rules", description="View rules")
+async def rules(interaction: discord.Interaction):
+    embed = discord.Embed(title=f"🍩 {BRAND_NAME} Rules", color=BRAND_COLOR)
+    embed.add_field(name="1. The Golden Rule", value="**Every order MUST include a donut.**", inline=False)
+    embed.add_field(name="2. Conduct", value="No NSFW.", inline=False)
+    embed.add_field(name="3. Queue", value="1 Active order at a time.", inline=False)
+    embed.add_field(name="4. Quantity", value="**Max of 3 Items per order.**", inline=False)
+    embed.set_footer(text="Violations result in bans. Bans are appealable via Ticket/Email.")
+    await interaction.response.send_message(embed=embed)
 
 @bot.tree.command(name="orderlist", description="View Queue")
 async def orderlist(interaction: discord.Interaction):
