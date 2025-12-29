@@ -1396,7 +1396,7 @@ client.on('interactionCreate', async (interaction) => {
 
 
         interaction.editReply({ 
-            content: "♨️ **Baking:** sequence engaged. 180s until Ready." 
+            content: "♨️ **PREPARATION:** sequence engaged. 180s until Ready." 
         });
 
 
@@ -1485,7 +1485,7 @@ client.on('interactionCreate', async (interaction) => {
 
         const script = await Script.findOne({ user_id: interaction.user.id });
 
-        const finalMsg = script ? script.script : `We are so happy to let you know that your Sugar Rush order is here! \nThank you for choosing us to satisfy your cravings. \nWe strive for perfection, so we’d love to hear from you. \nYou can rate your experience using `/rate ${o.order_id}\`. \nIf there were any issues with your delivery, please reach out directly using \`/complain ${o.order_id}\` So we can fix it!`;
+        const finalMsg = script ? script.script : `Your Sugar Rush order is here! Enjoy! Rate us with \`/rate ${o.order_id}\`.`;
 
 
         // BACKUP FAILSAFE: ROUTING FAIL (INVITE ERROR)
