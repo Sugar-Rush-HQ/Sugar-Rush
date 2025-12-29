@@ -37,7 +37,8 @@ const CHANNELS = {
     BACKUP: '1454888266451910901',
     RATINGS: '1454884136740327557',
     COMPLAINT: '1454886383662665972',
-    QUOTA: '1454895987322519672'
+    QUOTA: '1454895987322519672',
+    LOGS: '1455092188626292852'
 };
 
 // --- 2. DATABASE SCHEMAS ---
@@ -68,6 +69,11 @@ const userSchema = new mongoose.Schema({
     quota_fails_cook: { type: Number, default: 0 },
     quota_fails_deliver: { type: Number, default: 0 },
     warnings: { type: Number, default: 0 },
+    warning_history: [{ 
+        reason: String, 
+        moderator: String, 
+        date: { type: Date, default: Date.now } 
+    }],
     is_banned: { type: Number, default: 0 },
     ban_expires_at: Date
 });
@@ -100,6 +106,13 @@ const configSchema = new mongoose.Schema({
     date: Date
 });
 
+const serverBlacklistSchema = new mongoose.Schema({
+    guild_id: String,
+    reason: String,
+    banned_by: String,
+    date: { type: Date, default: Date.now }
+});
+
 const Order = mongoose.model('Order', orderSchema);
 const User = mongoose.model('User', userSchema);
 const PremiumUser = mongoose.model('PremiumUser', premiumSchema);
@@ -107,6 +120,7 @@ const PremiumCode = mongoose.model('PremiumCode', codeSchema);
 const Vacation = mongoose.model('Vacation', vacationSchema);
 const Script = mongoose.model('Script', scriptSchema);
 const Config = mongoose.model('Config', configSchema);
+const ServerBlacklist = mongoose.model('ServerBlacklist', serverBlacklistSchema);
 
 // --- 3. CLIENT SETUP ---
 const client = new Client({
@@ -157,6 +171,15 @@ const createEmbed = (title, description, color = BRAND_COLOR, fields = []) => {
     return embed;
 };
 
+const logToAdminChannel = async (embed) => {
+    try {
+        const channel = await client.channels.fetch(CHANNELS.LOGS).catch(() => null);
+        if (channel) await channel.send({ embeds: [embed] });
+    } catch (e) {
+        console.error("Failed to log to admin channel", e);
+    }
+};
+
 const updateMasterLog = async (orderId) => {
     try {
         const channel = await client.channels.fetch(CHANNELS.BACKUP).catch(() => null);
@@ -164,17 +187,31 @@ const updateMasterLog = async (orderId) => {
         const o = await Order.findOne({ order_id: orderId });
         if (!o) return;
 
+        const guild = client.guilds.cache.get(o.guild_id);
+        const serverName = guild ? guild.name : "Unknown Server";
+
         const embed = new EmbedBuilder()
             .setTitle(`🍩 Order #${o.order_id}`)
             .setColor(BRAND_COLOR)
             .addFields(
                 { name: 'Status', value: `**${o.status.toUpperCase()}**`, inline: true },
                 { name: 'Item', value: o.item, inline: true },
-                { name: 'Client', value: `<@${o.user_id}>`, inline: true },
+                { name: 'Client', value: `<@${o.user_id}>\n(ID: ${o.user_id})`, inline: true },
+                { name: 'Origin Server', value: `${serverName}\n(ID: ${o.guild_id})`, inline: true },
                 { name: 'Chef', value: o.chef_name || 'None', inline: true },
                 { name: 'Deliverer', value: o.deliverer_id ? `<@${o.deliverer_id}>` : 'None', inline: true }
             )
             .setTimestamp();
+
+        // --- NEW: IMAGE LOGGING LOGIC ---
+        if (o.images && o.images.length > 0) {
+            // Set the first image as the main preview
+            embed.setImage(o.images[0]);
+            
+            // Create a clickable list of ALL images
+            const linkList = o.images.map((url, index) => `[Image ${index + 1}](${url})`).join(' | ');
+            embed.addFields({ name: 'Proof/Attachments', value: linkList });
+        }
 
         if (!o.backup_msg_id) {
             const msg = await channel.send({ embeds: [embed] });
@@ -189,6 +226,29 @@ const updateMasterLog = async (orderId) => {
 
 const generateCode = () => `VIP-${Math.random().toString(36).substr(2, 4).toUpperCase()}-${Math.random().toString(36).substr(2, 4).toUpperCase()}`;
 
+// --- NEW: ETA CALCULATION ---
+const calculateETA = async () => {
+    const queueSize = await Order.countDocuments({ status: { $in: ['pending', 'claimed', 'cooking', 'ready'] } });
+    let totalStaff = 0;
+    try {
+        const supportGuild = client.guilds.cache.get(SUPPORT_SERVER_ID);
+        if (supportGuild) {
+            await supportGuild.members.fetch(); 
+            const cooks = supportGuild.roles.cache.get(ROLES.COOK)?.members.size || 0;
+            const drivers = supportGuild.roles.cache.get(ROLES.DELIVERY)?.members.size || 0;
+            totalStaff = cooks + drivers;
+        }
+    } catch (e) { totalStaff = 5; }
+
+    if (totalStaff === 0) return "Indefinite (No Staff Online)";
+    if (totalStaff <= 10) return "**2 - 6 Hours** (High Volume / Low Staff)";
+
+    const minutes = Math.ceil(((queueSize + 1) * 40) / totalStaff);
+    if (minutes < 15) return "15 - 30 Minutes"; 
+    if (minutes > 120) return `${Math.ceil(minutes/60)} Hours`;
+    return `${minutes} Minutes`;
+};
+
 // --- 5. EVENTS ---
 
 client.once('clientReady', async () => {
@@ -200,30 +260,36 @@ client.once('clientReady', async () => {
         console.log("✅ Connected to MongoDB");
     } catch (e) { console.error("❌ MongoDB Error:", e); }
 
+    // --- COMMAND DEFINITIONS ---
     const commands = [
         { name: 'order', description: 'Order food', options: [{ name: 'item', type: 3, required: true, description: 'Item' }] },
+        { name: 'orderstatus', description: 'Check the status and ETA of your active order' },
         { name: 'claim', description: 'Claim order', options: [{ name: 'id', type: 3, required: true, description: 'ID' }] },
         { 
             name: 'cook', 
             description: 'Cook order', 
             options: [
                 { name: 'id', type: 3, required: true, description: 'ID' }, 
-                { name: 'image', type: 11, required: true, description: 'Proof 1' },
-                { name: 'image2', type: 11, required: false, description: 'Proof 2' },
-                { name: 'image3', type: 11, required: false, description: 'Proof 3' }
+                { name: 'link', type: 3, required: false, description: 'Image Link (Priority)' },
+                { name: 'image', type: 11, required: false, description: 'Or Upload Proof 1' },
+                { name: 'image2', type: 11, required: false, description: 'Or Upload Proof 2' },
+                { name: 'image3', type: 11, required: false, description: 'Or Upload Proof 3' }
             ] 
         },
         { name: 'deliver', description: 'Deliver order', options: [{ name: 'id', type: 3, required: true, description: 'ID' }] },
         { name: 'setscript', description: 'Set delivery message', options: [{ name: 'message', type: 3, required: true, description: 'Script' }] },
         { name: 'invite', description: 'Get invite link' },
+        { name: 'support', description: 'Get link to support server' },
+        { name: 'help', description: 'Show available commands' },
         { name: 'warn', description: 'Warn user', options: [{ name: 'id', type: 3, required: true, description: 'ID' }, { name: 'reason', type: 3, required: true, description: 'Reason' }] },
         { name: 'fdo', description: 'Force delete order', options: [{ name: 'id', type: 3, required: true, description: 'ID' }, { name: 'reason', type: 3, required: true, description: 'Reason' }] },
+        { name: 'force_warn', description: 'Manager: Warn user (Post-Delivery)', options: [{ name: 'id', type: 3, required: true, description: 'Order ID' }, { name: 'reason', type: 3, required: true, description: 'Reason' }] },
         { name: 'unban', description: 'Unban user', options: [{ name: 'user', type: 6, required: true, description: 'User' }] },
         { name: 'rules', description: 'View rules' },
         { name: 'generate_codes', description: 'Owner: Gen Codes', options: [{ name: 'amount', type: 4, required: true, description: 'Amount' }] },
         { name: 'redeem', description: 'Redeem VIP', options: [{ name: 'code', type: 3, required: true, description: 'Code' }] },
-        { name: 'addvip', description: 'Owner: Give VIP', options: [{ name: 'user', type: 6, required: true, description: 'User' }] },
-        { name: 'removevip', description: 'Owner: Revoke VIP', options: [{ name: 'user', type: 6, required: true, description: 'User' }] },
+        { name: 'addvip', description: 'Owner: Give VIP', options: [{ name: 'user_input', type: 3, required: true, description: 'User ID or Ping' }] },
+        { name: 'removevip', description: 'Owner: Revoke VIP', options: [{ name: 'user_input', type: 3, required: true, description: 'User ID or Ping' }] },
         { name: 'vacation', description: 'Request vacation', options: [{ name: 'days', type: 4, required: true, description: 'Days' }, { name: 'reason', type: 3, required: true, description: 'Reason' }] },
         { name: 'quota', description: 'Check your current quota status' },
         { name: 'stats', description: 'Check staff stats (Rating, Totals)', options: [{ name: 'user', type: 6, required: false, description: 'User' }] },
@@ -231,11 +297,28 @@ client.once('clientReady', async () => {
         { name: 'complain', description: 'Complaint', options: [{ name: 'id', type: 3, required: true, description: 'ID' }, { name: 'reason', type: 3, required: true, description: 'Reason' }] },
         { name: 'orderlist', description: 'View queue' },
         { name: 'unclaim', description: 'Drop order', options: [{ name: 'id', type: 3, required: true, description: 'ID' }] },
-        { name: 'runquota', description: 'Manager: Force Run Quota' }
+        { name: 'runquota', description: 'Manager: Force Run Quota' },
+        { name: 'blacklist_server', description: 'Block a server from ordering', options: [{ name: 'server_id', type: 3, required: true, description: 'Guild ID' }, { name: 'reason', type: 3, required: true, description: 'Reason' }] },
+        { name: 'unblacklist_server', description: 'Unblock a server', options: [{ name: 'server_id', type: 3, required: true, description: 'Guild ID' }] }
     ];
 
-    const rest = new REST({ version: '10' }).setToken(BOT_TOKEN);
-    try { await rest.put(Routes.applicationCommands(client.user.id), { body: commands }); } catch (e) { console.error(e); }
+    // --- COMMAND SYNCER FUNCTION ---
+    const syncCommands = async () => {
+        try {
+            console.log("⏳ Refreshing application (/) commands...");
+            const rest = new REST({ version: '10' }).setToken(BOT_TOKEN);
+            await rest.put(Routes.applicationCommands(client.user.id), { body: commands });
+            console.log("✅ Successfully reloaded application (/) commands.");
+        } catch (error) {
+            console.error("❌ Command Sync Error:", error);
+        }
+    };
+
+    // 1. Run immediately on start
+    await syncCommands();
+
+    // 2. Run every 12 Hours
+    setInterval(syncCommands, 12 * 60 * 60 * 1000);
     
     // Status Heartbeat
     setInterval(() => {
@@ -250,7 +333,7 @@ client.once('clientReady', async () => {
 async function checkTasks() {
     const now = new Date();
 
-    // 1. Auto Delivery Logic
+    // 1. Auto Delivery
     const threshold = new Date(now - 20 * 60000);
     const overdue = await Order.find({ status: 'ready', ready_at: { $lt: threshold } });
     
@@ -260,7 +343,11 @@ async function checkTasks() {
             if (guild) {
                 const channel = guild.channels.cache.get(o.channel_id);
                 if (channel) {
-                    const embed = createEmbed("🤖 Auto-Delivery", `**Chef:** ${o.chef_name}\n\n*This order was automatically delivered because it waited over 20 minutes.*`, BRAND_COLOR);
+                    const embed = createEmbed(
+                        "📦 Special Delivery Arrived!",
+                        `**Chef:** ${o.chef_name}\n\nHere is your order! To ensure you get your treats while they are fresh, our express courier system has dropped this off for you.\n\n*Thank you for choosing ${BRAND_NAME}! 🍩*`,
+                        BRAND_COLOR
+                    );
                     if(o.images && o.images.length > 0) embed.setImage(o.images[0]);
                     
                     await channel.send({ content: `<@${o.user_id}>`, embeds: [embed] });
@@ -385,37 +472,101 @@ client.on('interactionCreate', async interaction => {
     if (interaction.isChatInputCommand()) {
         const { commandName } = interaction;
 
-        // 1. KITCHEN CHANNEL LOCK (Claim, Cook) - Unless Manager/Owner
+        // HELP COMMAND (SMART LISTING)
+        if (commandName === 'help') {
+            const isSupport = interaction.guildId === SUPPORT_SERVER_ID;
+            const isKitchen = interaction.channelId === CHANNELS.COOK;
+            const isDelivery = interaction.channelId === CHANNELS.DELIVERY;
+            const visibleCommands = [];
+
+            // 1. PUBLIC COMMANDS
+            visibleCommands.push('**/order** - Order food');
+            visibleCommands.push('**/orderstatus** - Check your order');
+            visibleCommands.push('**/rules** - View rules');
+            visibleCommands.push('**/invite** - Invite bot');
+            visibleCommands.push('**/support** - Get help');
+            visibleCommands.push('**/rate** - Rate service');
+            visibleCommands.push('**/complain** - File complaint');
+            visibleCommands.push('**/redeem** - Redeem VIP code');
+
+            // 2. KITCHEN COMMANDS
+            if ((perms.isStaff && (isKitchen || isSupport)) || perms.isManager || perms.isOwner) {
+                const note = (isKitchen || perms.isManager || perms.isOwner) ? "" : " *(Kitchen Channel Only)*";
+                visibleCommands.push(`**/claim** - Claim an order${note}`);
+                visibleCommands.push(`**/cook** - Start cooking${note}`);
+                visibleCommands.push(`**/setscript** - Set delivery message`);
+            }
+
+            // 3. DELIVERY COMMANDS
+            if ((perms.isStaff && (isDelivery || isSupport)) || perms.isManager || perms.isOwner) {
+                const note = (isDelivery || perms.isManager || perms.isOwner) ? "" : " *(Delivery Channel Only)*";
+                visibleCommands.push(`**/deliver** - Deliver order${note}`);
+                const listNote = (isKitchen || isDelivery || perms.isManager || perms.isOwner) ? "" : " *(Kitchen/Delivery Only)*";
+                visibleCommands.push(`**/orderlist** - View queue${listNote}`);
+            }
+
+            // 4. SUPPORT SERVER COMMANDS
+            if ((perms.isStaff && isSupport) || perms.isOwner) {
+                visibleCommands.push('**/vacation** - Request time off');
+                visibleCommands.push('**/quota** - Check weekly quota');
+                visibleCommands.push('**/stats** - View staff stats');
+            }
+
+            // 5. MANAGER COMMANDS
+            if ((perms.isManager && isSupport) || perms.isOwner) {
+                visibleCommands.push('\n__**Manager Commands**__');
+                visibleCommands.push('**/warn** - Warn user');
+                visibleCommands.push('**/fdo** - Force delete order');
+                visibleCommands.push('**/force_warn** - Warn (Post-Delivery)');
+                visibleCommands.push('**/unban** - Unban user');
+                visibleCommands.push('**/unclaim** - Force unclaim order');
+                visibleCommands.push('**/runquota** - Force quota check');
+            }
+
+            // 6. OWNER COMMANDS
+            if (perms.isOwner) {
+                visibleCommands.push('\n__**Owner Commands**__');
+                visibleCommands.push('**/addvip** - Give VIP');
+                visibleCommands.push('**/removevip** - Remove VIP');
+                visibleCommands.push('**/generate_codes** - Create VIP codes');
+                visibleCommands.push('**/blacklist_server** - Ban server');
+                visibleCommands.push('**/unblacklist_server** - Unban server');
+            }
+
+            const embed = createEmbed("🍩 Available Commands", visibleCommands.join('\n'), BRAND_COLOR)
+                .setFooter({ text: `Context: ${interaction.guild.name} | Showing commands available to you.` });
+            
+            return interaction.reply({ embeds: [embed], ephemeral: true });
+        }
+
+        // ... [REST OF COMMAND LOGIC] ...
         if (['claim', 'cook'].includes(commandName)) {
             if (interaction.channelId !== CHANNELS.COOK && !perms.isManager && !perms.isOwner) {
                 return interaction.reply({ embeds: [createEmbed("❌ Wrong Channel", `Please use this command in <#${CHANNELS.COOK}>.`, ERROR_COLOR)], ephemeral: true });
             }
         }
 
-        // 2. DELIVERY CHANNEL LOCK (Deliver) - Unless Manager/Owner
         if (commandName === 'deliver') {
             if (interaction.channelId !== CHANNELS.DELIVERY && !perms.isManager && !perms.isOwner) {
                 return interaction.reply({ embeds: [createEmbed("❌ Wrong Channel", `Please use this command in <#${CHANNELS.DELIVERY}>.`, ERROR_COLOR)], ephemeral: true });
             }
         }
 
-        // 3. SUPPORT SERVER LOCK (All other staff commands)
-        const restrictedCommands = ['warn', 'fdo', 'unban', 'vacation', 'quota', 'stats', 'runquota', 'addvip', 'removevip', 'generate_codes', 'setscript', 'orderlist'];
+        const restrictedCommands = ['warn', 'fdo', 'force_warn', 'unban', 'vacation', 'quota', 'stats', 'runquota', 'addvip', 'removevip', 'generate_codes', 'setscript', 'orderlist', 'blacklist_server', 'unblacklist_server'];
         if (restrictedCommands.includes(commandName)) {
             if (interaction.guildId !== SUPPORT_SERVER_ID && !perms.isOwner) {
                 return interaction.reply({ embeds: [createEmbed("❌ Restricted", "This command can only be used in the **Support Server**.", ERROR_COLOR)], ephemeral: true });
             }
         }
         
-        // 4. OWNER LOCK (Explicit check for strict owner commands)
-        if (['addvip', 'removevip', 'generate_codes'].includes(commandName)) {
+        if (['addvip', 'removevip', 'generate_codes', 'blacklist_server', 'unblacklist_server'].includes(commandName)) {
             if (!perms.isOwner) {
                 return interaction.reply({ embeds: [createEmbed("❌ Restricted", "This command is restricted to the **Bot Owner**.", ERROR_COLOR)], ephemeral: true });
             }
         }
     }
 
-    // --- 7B. BUTTON & MODAL HANDLING (VACATION) ---
+    // --- 7B. BUTTON & MODAL HANDLING ---
     if (interaction.isButton()) {
         if (!perms.isManager && !perms.isOwner) return interaction.reply({ embeds: [createEmbed("❌ Access Denied", "Managers only.", ERROR_COLOR)], ephemeral: true });
         
@@ -425,30 +576,15 @@ client.on('interactionCreate', async interaction => {
         if (action === 'vacApprove') {
             const endDate = new Date();
             endDate.setDate(endDate.getDate() + days);
-
-            await Vacation.findOneAndUpdate(
-                { user_id: userId },
-                { status: 'active', end_date: endDate },
-                { upsert: true }
-            );
-
+            await Vacation.findOneAndUpdate({ user_id: userId }, { status: 'active', end_date: endDate }, { upsert: true });
             const supportGuild = client.guilds.cache.get(SUPPORT_SERVER_ID);
             if(supportGuild) {
                 const target = await supportGuild.members.fetch(userId).catch(() => null);
                 if (target) target.roles.add(ROLES.BYPASS).catch(() => {});
             }
-
-            const embed = EmbedBuilder.from(interaction.message.embeds[0])
-                .setColor(SUCCESS_COLOR)
-                .setFooter({ text: `Approved by ${interaction.user.username}` });
-
+            const embed = EmbedBuilder.from(interaction.message.embeds[0]).setColor(SUCCESS_COLOR).setFooter({ text: `Approved by ${interaction.user.username}` });
             await interaction.message.edit({ embeds: [embed], components: [] });
-            await interaction.reply({ embeds: [createEmbed("✅ Approved", `Vacation approved for ${days} days.`, SUCCESS_COLOR)], ephemeral: true });
-            
-            try { 
-                const u = await client.users.fetch(userId);
-                u.send({ embeds: [createEmbed("🌴 Vacation Approved", `Your request for ${days} days has been approved! Enjoy your break.`, SUCCESS_COLOR)] }); 
-            } catch(e){}
+            await interaction.reply({ embeds: [createEmbed("✅ Approved", `Vacation approved.`, SUCCESS_COLOR)], ephemeral: true });
         }
 
         if (action === 'vacEdit') {
@@ -473,53 +609,26 @@ client.on('interactionCreate', async interaction => {
         if (action === 'vacModalEdit') {
             const newDays = parseInt(interaction.fields.getTextInputValue('newDays'));
             if (isNaN(newDays) || newDays < 1 || newDays > 14) return interaction.reply({ embeds: [createEmbed("❌ Error", "Days must be 1-14.", ERROR_COLOR)], ephemeral: true });
-
             const endDate = new Date();
             endDate.setDate(endDate.getDate() + newDays);
-
-            await Vacation.findOneAndUpdate(
-                { user_id: userId },
-                { status: 'active', end_date: endDate },
-                { upsert: true }
-            );
-
+            await Vacation.findOneAndUpdate({ user_id: userId }, { status: 'active', end_date: endDate }, { upsert: true });
             const supportGuild = client.guilds.cache.get(SUPPORT_SERVER_ID);
             if(supportGuild) {
                 const target = await supportGuild.members.fetch(userId).catch(() => null);
                 if (target) target.roles.add(ROLES.BYPASS).catch(() => {});
             }
-
             const oldEmbed = interaction.message.embeds[0];
-            const embed = EmbedBuilder.from(oldEmbed)
-                .setColor(SUCCESS_COLOR)
-                .setDescription(oldEmbed.description.replace(/Duration: \d+ Days/, `Duration: ${newDays} Days (Edited)`))
-                .setFooter({ text: `Approved (Edited) by ${interaction.user.username}` });
-
+            const embed = EmbedBuilder.from(oldEmbed).setColor(SUCCESS_COLOR).setDescription(oldEmbed.description.replace(/Duration: \d+ Days/, `Duration: ${newDays} Days (Edited)`)).setFooter({ text: `Approved (Edited) by ${interaction.user.username}` });
             await interaction.message.edit({ embeds: [embed], components: [] });
             await interaction.reply({ embeds: [createEmbed("✅ Approved & Edited", `Vacation set to ${newDays} days.`, SUCCESS_COLOR)], ephemeral: true });
-            
-            try { 
-                const u = await client.users.fetch(userId);
-                u.send({ embeds: [createEmbed("🌴 Vacation Approved (Edited)", `Your request was modified and approved for ${newDays} days.`, SUCCESS_COLOR)] }); 
-            } catch(e){}
         }
 
         if (action === 'vacModalDeny') {
             const reason = interaction.fields.getTextInputValue('denyReason');
-            
             const oldEmbed = interaction.message.embeds[0];
-            const embed = EmbedBuilder.from(oldEmbed)
-                .setColor(ERROR_COLOR)
-                .addFields({ name: "Denial Reason", value: reason })
-                .setFooter({ text: `Denied by ${interaction.user.username}` });
-
+            const embed = EmbedBuilder.from(oldEmbed).setColor(ERROR_COLOR).addFields({ name: "Denial Reason", value: reason }).setFooter({ text: `Denied by ${interaction.user.username}` });
             await interaction.message.edit({ embeds: [embed], components: [] });
             await interaction.reply({ embeds: [createEmbed("❌ Request Denied", "User has been notified.", SUCCESS_COLOR)], ephemeral: true });
-            
-            try { 
-                const u = await client.users.fetch(userId);
-                u.send({ embeds: [createEmbed("❌ Vacation Denied", `Reason: ${reason}`, ERROR_COLOR)] }); 
-            } catch(e){}
         }
         return;
     }
@@ -532,6 +641,12 @@ client.on('interactionCreate', async interaction => {
         const item = interaction.options.getString('item');
         const oid = Math.random().toString(36).substring(2, 8).toUpperCase();
         
+        const blacklist = await ServerBlacklist.findOne({ guild_id: interaction.guild.id });
+        if (blacklist) {
+            const embed = createEmbed("🛑 Action Blocked", `This server is **Blacklisted** from using Sugar Rush services.\n\n**Reason:** ${blacklist.reason}\n\n*Please contact support via `/support` if you believe this is an error.*`, ERROR_COLOR);
+            return interaction.reply({ embeds: [embed], ephemeral: true });
+        }
+
         const u = await User.findOne({ user_id: interaction.user.id });
         if(u && u.is_banned) return interaction.reply({ embeds: [createEmbed("🛑 Action Blocked", "You are permanently banned.", ERROR_COLOR)], ephemeral: true });
         
@@ -540,6 +655,8 @@ client.on('interactionCreate', async interaction => {
 
         const vipUser = await PremiumUser.findOne({ user_id: interaction.user.id, is_vip: true });
         const isVip = !!vipUser;
+
+        const eta = await calculateETA(); // Calculate ETA
 
         await new Order({
             order_id: oid, user_id: interaction.user.id, guild_id: interaction.guild.id,
@@ -554,7 +671,51 @@ client.on('interactionCreate', async interaction => {
             const embed = createEmbed(title, `**Item:** ${item}\n**User:** <@${interaction.user.id}>\n**ID:** \`${oid}\``, isVip ? 0x9B59B6 : BRAND_COLOR);
             channel.send({ content: ping, embeds: [embed] });
         }
-        await interaction.reply({ embeds: [createEmbed("✅ Order Placed", `Your order ID is \`${oid}\`. Sit tight!`, SUCCESS_COLOR)], ephemeral: true });
+        
+        const replyEmbed = createEmbed("✅ Order Placed", `Your order ID is \`${oid}\`. Sit tight!`, SUCCESS_COLOR)
+            .addFields(
+                { name: "Estimated Delivery", value: eta },
+                { name: "Disclaimer", value: "*Times are estimates and not guaranteed. Delays may occur based on staff availability.*" }
+            );
+        await interaction.reply({ embeds: [replyEmbed], ephemeral: true });
+    }
+
+    // --- ORDER STATUS (UPDATED LOGIC) ---
+    if (commandName === 'orderstatus') {
+        const order = await Order.findOne({ user_id: interaction.user.id, status: { $in: ['pending', 'claimed', 'cooking', 'ready'] } });
+        if (!order) return interaction.reply({ embeds: [createEmbed("❌ No Active Order", "You do not have an order in the queue.", ERROR_COLOR)], ephemeral: true });
+
+        let eta = "";
+        let progressBar = "";
+        
+        if (order.status === 'cooking') {
+            eta = "~23 Minutes (Finishing Cook + Delivery)";
+            progressBar = "🟧🟧⬜⬜ (Cooking)";
+        } else if (order.status === 'ready') {
+            eta = "10 - 20 Minutes (Awaiting Driver / Auto-Delivery)";
+            progressBar = "🟧🟧🟧⬜ (Ready)";
+        } else if (order.status === 'pending') {
+            eta = await calculateETA();
+            progressBar = "⬜⬜⬜⬜ (Pending)";
+        } else if (order.status === 'claimed') {
+            eta = await calculateETA();
+            progressBar = "🟧⬜⬜⬜ (Prep)";
+        }
+
+        const embed = createEmbed("🧾 Order Status", `**Order ID:** \`${order.order_id}\``, BRAND_COLOR)
+            .addFields(
+                { name: "Item", value: order.item, inline: true },
+                { name: "Status", value: `**${order.status.toUpperCase()}**`, inline: true },
+                { name: "Progress", value: progressBar },
+                { name: "Chef", value: order.chef_name || "Waiting for Chef...", inline: true },
+                { name: "Estimated Delivery", value: eta, inline: true }
+            );
+        
+        if ((order.status === 'cooking' || order.status === 'ready') && order.images.length > 0) {
+            embed.setImage(order.images[0]);
+        }
+
+        await interaction.reply({ embeds: [embed], ephemeral: true });
     }
 
     // --- CLAIM ---
@@ -584,14 +745,28 @@ client.on('interactionCreate', async interaction => {
         const img1 = interaction.options.getAttachment('image');
         const img2 = interaction.options.getAttachment('image2');
         const img3 = interaction.options.getAttachment('image3');
+        const link = interaction.options.getString('link');
+
+        // VALIDATION: Must have at least 1 image (File or Link)
+        if (!img1 && !img2 && !img3 && !link) {
+            return interaction.reply({ embeds: [createEmbed("❌ Error", "You must provide at least one image or link.", ERROR_COLOR)], ephemeral: true });
+        }
+
+        // VALIDATION: If link provided, must look like an image
+        if (link && !/\.(jpg|jpeg|png|gif|webp)(\?.*)?$/i.test(link)) {
+            return interaction.reply({ embeds: [createEmbed("❌ Error", "Link must end in .jpg, .png, .gif, or .webp.", ERROR_COLOR)], ephemeral: true });
+        }
         
         const order = await Order.findOne({ order_id: oid });
         if(!order || order.status !== 'claimed') return interaction.reply({ embeds: [createEmbed("❌ Invalid Order", "Order not claimed or invalid status.", ERROR_COLOR)], ephemeral: true });
         
         order.status = 'cooking';
-        order.images = [img1.url];
-        if(img2) order.images.push(img2.url); 
+        order.images = [];
+        if(img1) order.images.push(img1.url);
+        if(img2) order.images.push(img2.url);
         if(img3) order.images.push(img3.url);
+        if(link) order.images.push(link);
+
         await order.save();
         
         await User.findOneAndUpdate({ user_id: interaction.user.id }, { $inc: { cook_count_week: 1, cook_count_total: 1 } }, { upsert: true });
@@ -631,12 +806,19 @@ client.on('interactionCreate', async interaction => {
     // --- DELIVER ---
     if (commandName === 'deliver') {
         if (!perms.isStaff) return interaction.reply({ embeds: [createEmbed("❌ Access Denied", "Staff only.", ERROR_COLOR)], ephemeral: true });
+        
+        await interaction.deferReply({ ephemeral: true });
+
         const oid = interaction.options.getString('id');
         const order = await Order.findOne({ order_id: oid });
-        if(!order || order.status !== 'ready') return interaction.reply({ embeds: [createEmbed("❌ Invalid Order", "Order not ready for delivery.", ERROR_COLOR)], ephemeral: true });
+        if(!order || order.status !== 'ready') return interaction.editReply({ embeds: [createEmbed("❌ Invalid Order", "Order not ready for delivery.", ERROR_COLOR)] });
 
+        // UPDATED DEFAULT SCRIPT
+        const defaultScript = `We are so happy to let you know that your Sugar Rush order is here! Thank you for choosing us to satisfy your cravings.\n\nWe strive for perfection, so we’d love to hear from you. You can rate your experience using \`/rate ${oid}\`.\n\nIf there were any issues with your delivery, please reach out directly using \`/complain ${oid}\` so we can fix it!`;
+        
         const scriptDoc = await Script.findOne({ user_id: interaction.user.id });
-        const script = scriptDoc ? scriptDoc.script : "Here is your order! 🍩";
+        const script = scriptDoc ? scriptDoc.script : defaultScript;
+        
         const guild = client.guilds.cache.get(order.guild_id);
         const channel = guild?.channels.cache.get(order.channel_id);
         
@@ -648,10 +830,8 @@ client.on('interactionCreate', async interaction => {
         if (invite) {
             try {
                 const deliveryMsg = `**Chef:** ${order.chef_name}\n**Driver:** ${interaction.user.username}\n\n${script}`;
-                await interaction.user.send({
-                    content: `🚴 **Delivery Instructions for Order #${oid}**\n\n1. **Join Server:** ${invite.url}\n2. **Paste this Message:**\n\`\`\`\n${deliveryMsg}\n\`\`\`\n*(Don't forget to attach the images below!)*`,
-                    files: order.images
-                });
+                const deliveryEmbed = createEmbed(`🚴 Delivery Instructions: #${oid}`, `**1. Join Server:** [Click Here](${invite.url})\n\n**2. Copy & Paste this Script:**\n\`\`\`\n${deliveryMsg}\n\`\`\`\n\n*(Don't forget to attach the images below!)*`, BRAND_COLOR);
+                await interaction.user.send({ embeds: [deliveryEmbed], files: order.images });
                 
                 order.status = 'delivered'; 
                 order.deliverer_id = interaction.user.id;
@@ -660,147 +840,262 @@ client.on('interactionCreate', async interaction => {
                 await User.findOneAndUpdate({ user_id: interaction.user.id }, { $inc: { deliver_count_week: 1, deliver_count_total: 1 } }, { upsert: true });
                 updateMasterLog(oid);
                 
-                await interaction.reply({ embeds: [createEmbed("✅ Delivery Started", "Check your DMs for the invite link and script!", SUCCESS_COLOR)], ephemeral: true });
+                await interaction.editReply({ embeds: [createEmbed("✅ Delivery Started", "Check your DMs for the invite link and script!", SUCCESS_COLOR)] });
             } catch (err) {
-                await interaction.reply({ embeds: [createEmbed("❌ DM Failed", "Please open your DMs so I can send you the invite.", ERROR_COLOR)], ephemeral: true });
+                await interaction.editReply({ embeds: [createEmbed("❌ DM Failed", "Please open your DMs so I can send you the invite.", ERROR_COLOR)] });
             }
         } else {
             if(channel) {
                 const embed = createEmbed("🚴 Order Delivered", `**Chef:** ${order.chef_name}\n**Driver:** ${interaction.user.username}\n\n**Message:**\n${script}`, BRAND_COLOR);
                 if(order.images && order.images.length > 0) embed.setImage(order.images[0]);
-                
                 await channel.send({ content: `<@${order.user_id}>`, embeds: [embed] });
                 if(order.images.length > 1) await channel.send({ files: order.images.slice(1) });
 
                 order.status = 'delivered'; 
                 order.deliverer_id = interaction.user.id;
                 await order.save();
-                
                 await User.findOneAndUpdate({ user_id: interaction.user.id }, { $inc: { deliver_count_week: 1, deliver_count_total: 1 } }, { upsert: true });
                 updateMasterLog(oid);
-                
-                await interaction.reply({ embeds: [createEmbed("⚠️ Invite Failed", "I couldn't create an invite, so I delivered the order for you.", BRAND_COLOR)], ephemeral: true });
+                await interaction.editReply({ embeds: [createEmbed("⚠️ Invite Failed", "I couldn't create an invite, so I delivered the order for you.", BRAND_COLOR)] });
             } else {
-                await interaction.reply({ embeds: [createEmbed("❌ Delivery Failed", "Could not reach the customer's channel.", ERROR_COLOR)], ephemeral: true });
+                await interaction.editReply({ embeds: [createEmbed("❌ Delivery Failed", "Could not reach the customer's channel.", ERROR_COLOR)] });
             }
         }
     }
 
-    // --- QUOTA ---
-    if (commandName === 'quota') {
-        if (!perms.isStaff) return interaction.reply({ embeds: [createEmbed("❌ Access Denied", "Staff only.", ERROR_COLOR)], ephemeral: true });
-        
-        const guild = interaction.guild;
-        const cookRole = guild.roles.cache.get(ROLES.COOK);
-        const delRole = guild.roles.cache.get(ROLES.DELIVERY);
-        await guild.members.fetch(); 
-        const cooks = cookRole ? cookRole.members.size : 1;
-        const deliverers = delRole ? delRole.members.size : 1;
-
-        const allUsers = await User.find({});
-        let totalCook = 0; let totalDel = 0;
-        allUsers.forEach(u => { totalCook += u.cook_count_week; totalDel += u.deliver_count_week; });
-
-        const cTarget = calculateTargets(totalCook, cooks);
-        const dTarget = calculateTargets(totalDel, deliverers);
-
-        const u = await User.findOne({ user_id: interaction.user.id }) || {};
-        
-        let desc = "";
-        if (perms.isCook) {
-            const target = cTarget.norm; 
-            const status = (u.cook_count_week >= target) ? "✅ On Track" : "⚠️ Behind";
-            desc += `👨‍🍳 **Cooking:** ${u.cook_count_week || 0} / ${target} (${status})\n`;
-        }
-        if (perms.isDelivery) {
-            const target = dTarget.norm;
-            const status = (u.deliver_count_week >= target) ? "✅ On Track" : "⚠️ Behind";
-            desc += `🚴 **Delivery:** ${u.deliver_count_week || 0} / ${target} (${status})\n`;
-        }
-        
-        await interaction.reply({ embeds: [createEmbed("📊 Your Quota Status", desc, BRAND_COLOR)], ephemeral: true });
-    }
-
-    // --- STATS ---
-    if (commandName === 'stats') {
-        if (!perms.isStaff) return interaction.reply({ embeds: [createEmbed("❌ Access Denied", "Staff only.", ERROR_COLOR)], ephemeral: true });
-        const target = interaction.options.getUser('user') || interaction.user;
-        const u = await User.findOne({ user_id: target.id }) || {};
-        const ratedOrders = await Order.find({ deliverer_id: target.id, rating: { $exists: true } });
-        let avgRating = "N/A";
-        if (ratedOrders.length > 0) {
-            const sum = ratedOrders.reduce((a, b) => a + b.rating, 0);
-            avgRating = (sum / ratedOrders.length).toFixed(1) + " ⭐";
-        }
-        const embed = createEmbed(`📈 Stats: ${target.username}`, "", 0x9B59B6, [
-            { name: "👨‍🍳 Cooking", value: `**Weekly:** ${u.cook_count_week || 0}\n**Lifetime:** ${u.cook_count_total || 0}`, inline: true },
-            { name: "🚴 Delivery", value: `**Weekly:** ${u.deliver_count_week || 0}\n**Lifetime:** ${u.deliver_count_total || 0}`, inline: true },
-            { name: "⭐ Avg Rating", value: avgRating, inline: false }
-        ]).setThumbnail(target.displayAvatarURL());
-        
-        await interaction.reply({ embeds: [embed] });
-    }
-
-    // --- RATE ---
-    if (commandName === 'rate') {
-        const oid = interaction.options.getString('id');
-        const stars = interaction.options.getInteger('stars');
-        const order = await Order.findOne({ order_id: oid, user_id: interaction.user.id });
-        if(!order || order.status !== 'delivered') return interaction.reply({ embeds: [createEmbed("❌ Invalid Order", "Order must be delivered before rating.", ERROR_COLOR)], ephemeral: true });
-        order.rating = stars; await order.save(); updateMasterLog(oid);
-        const chan = client.channels.cache.get(CHANNELS.RATINGS);
-        if(chan) {
-            const embed = createEmbed("⭐ New Rating!", `**Order:** \`${oid}\`\n**Rating:** ${"⭐".repeat(stars)}\n**Chef:** ${order.chef_name}\n**Deliverer:** <@${order.deliverer_id}>`, 0xF1C40F);
-            chan.send({ embeds: [embed] });
-        }
-        await interaction.reply({ embeds: [createEmbed("✅ Rated", "Thank you for your feedback!", SUCCESS_COLOR)], ephemeral: true });
-    }
-
-    if (commandName === 'invite') {
-        const link = client.generateInvite({ 
-            scopes: ['bot', 'applications.commands'], 
-            permissions: [
-                PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages,
-                PermissionsBitField.Flags.EmbedLinks, PermissionsBitField.Flags.AttachFiles,
-                PermissionsBitField.Flags.UseExternalEmojis, PermissionsBitField.Flags.ReadMessageHistory,
-                PermissionsBitField.Flags.CreateInstantInvite
-            ] 
-        });
-        const embed = createEmbed("🔗 Invite Sugar Rush", "Click the button below to invite me to your server!", BRAND_COLOR);
-        const row = new ActionRowBuilder().addComponents(new ButtonBuilder().setLabel("Invite Me").setStyle(ButtonStyle.Link).setURL(link));
+    // --- SUPPORT ---
+    if (commandName === 'support') {
+        const embed = createEmbed("🆘 Need Help?", "Click the button below to join our Support Server for assistance, bug reports, or applications.", BRAND_COLOR);
+        const row = new ActionRowBuilder().addComponents(new ButtonBuilder().setLabel("Join Support Server").setStyle(ButtonStyle.Link).setURL(SUPPORT_SERVER_LINK));
         await interaction.reply({ embeds: [embed], components: [row], ephemeral: true });
     }
 
-    if (commandName === 'generate_codes') {
-        if(interaction.user.id !== ROLES.OWNER) return interaction.reply({ embeds: [createEmbed("❌ Owner Only", "You cannot use this.", ERROR_COLOR)], ephemeral: true });
-        const amount = interaction.options.getInteger('amount');
-        let txt = ""; for(let i=0; i<amount; i++) { const c = generateCode(); await new PremiumCode({ code: c, created_by: interaction.user.id }).save(); txt += c + "\n"; }
-        await interaction.reply({ embeds: [createEmbed("✅ Codes Generated", `Generated ${amount} codes. Check file.`, SUCCESS_COLOR)], files: [{ attachment: Buffer.from(txt), name: 'codes.txt' }], ephemeral: true });
+    // --- SERVER BLACKLIST ---
+    if (commandName === 'blacklist_server') {
+        if (!perms.isOwner) return interaction.reply({ embeds: [createEmbed("❌ Denied", "Owner only.", ERROR_COLOR)], ephemeral: true });
+        const guildId = interaction.options.getString('server_id');
+        const reason = interaction.options.getString('reason');
+        await ServerBlacklist.findOneAndUpdate({ guild_id: guildId }, { reason: reason, banned_by: interaction.user.username }, { upsert: true });
+        const log = createEmbed("🛑 Server Blacklisted", `**ID:** ${guildId}\n**Reason:** ${reason}\n**Admin:** ${interaction.user.username}`, ERROR_COLOR);
+        await logToAdminChannel(log);
+        await interaction.reply({ embeds: [createEmbed("🛑 Server Blacklisted", `**ID:** ${guildId}\n**Reason:** ${reason}`, ERROR_COLOR)] });
     }
 
-    if (commandName === 'redeem') {
-        const code = interaction.options.getString('code');
-        const valid = await PremiumCode.findOneAndUpdate({ code: code, status: 'unused' }, { status: 'redeemed' });
-        if(!valid) return interaction.reply({ embeds: [createEmbed("❌ Invalid Code", "Code is invalid or already used.", ERROR_COLOR)], ephemeral: true });
-        await PremiumUser.findOneAndUpdate({ user_id: interaction.user.id }, { is_vip: true, expires_at: new Date(Date.now() + 30*24*60*60*1000) }, { upsert: true });
-        try { (await client.guilds.cache.get(SUPPORT_SERVER_ID).members.fetch(interaction.user.id)).roles.add(ROLES.VIP); } catch(e){}
-        await interaction.reply({ embeds: [createEmbed("💎 VIP Activated", "You now have 30 days of VIP benefits!", 0x9B59B6)], ephemeral: true });
+    if (commandName === 'unblacklist_server') {
+        if (!perms.isOwner) return interaction.reply({ embeds: [createEmbed("❌ Denied", "Owner only.", ERROR_COLOR)], ephemeral: true });
+        const guildId = interaction.options.getString('server_id');
+        await ServerBlacklist.deleteOne({ guild_id: guildId });
+        const log = createEmbed("✅ Server Unblacklisted", `**ID:** ${guildId}\n**Admin:** ${interaction.user.username}`, SUCCESS_COLOR);
+        await logToAdminChannel(log);
+        await interaction.reply({ embeds: [createEmbed("✅ Server Unblacklisted", `ID: ${guildId}`, SUCCESS_COLOR)] });
     }
 
+    // --- VIP ADD/REMOVE ---
     if (commandName === 'addvip') {
-        if(interaction.user.id !== ROLES.OWNER) return interaction.reply({ embeds: [createEmbed("❌ Owner Only", "You cannot use this.", ERROR_COLOR)], ephemeral: true });
-        const target = interaction.options.getUser('user');
-        await PremiumUser.findOneAndUpdate({ user_id: target.id }, { is_vip: true, expires_at: new Date(Date.now() + 30*24*60*60*1000) }, { upsert: true });
-        try { (await client.guilds.cache.get(SUPPORT_SERVER_ID).members.fetch(target.id)).roles.add(ROLES.VIP); } catch(e){}
-        await interaction.reply({ embeds: [createEmbed("💎 VIP Gifted", `${target.username} has been given VIP status.`, SUCCESS_COLOR)] });
+        if (!perms.isOwner) return interaction.reply({ embeds: [createEmbed("❌ Denied", "Owner only.", ERROR_COLOR)], ephemeral: true });
+        const input = interaction.options.getString('user_input');
+        const userId = input.replace(/\D/g, ''); 
+        await PremiumUser.findOneAndUpdate({ user_id: userId }, { is_vip: true, expires_at: new Date(Date.now() + 30*24*60*60*1000) }, { upsert: true });
+        try { (await client.guilds.cache.get(SUPPORT_SERVER_ID).members.fetch(userId)).roles.add(ROLES.VIP); } catch(e){}
+        await interaction.reply({ embeds: [createEmbed("💎 VIP Gifted", `User ID: ${userId} has been given VIP status.`, SUCCESS_COLOR)] });
     }
 
     if (commandName === 'removevip') {
-        if(interaction.user.id !== ROLES.OWNER) return interaction.reply({ embeds: [createEmbed("❌ Owner Only", "You cannot use this.", ERROR_COLOR)], ephemeral: true });
+        if (!perms.isOwner) return interaction.reply({ embeds: [createEmbed("❌ Denied", "Owner only.", ERROR_COLOR)], ephemeral: true });
+        const input = interaction.options.getString('user_input');
+        const userId = input.replace(/\D/g, '');
+        await PremiumUser.findOneAndUpdate({ user_id: userId }, { is_vip: false, expires_at: null });
+        try { (await client.guilds.cache.get(SUPPORT_SERVER_ID).members.fetch(userId)).roles.remove(ROLES.VIP); } catch(e){}
+        await interaction.reply({ embeds: [createEmbed("📉 VIP Removed", `User ID: ${userId} lost VIP status.`, SUCCESS_COLOR)] });
+    }
+
+    // --- WARN (STAFF ONLY - BEFORE COOKING) ---
+    if (commandName === 'warn') {
+        if (!perms.isStaff) return interaction.reply({ embeds: [createEmbed("❌ Access Denied", "Staff only.", ERROR_COLOR)], ephemeral: true });
+        
+        const oid = interaction.options.getString('id'); 
+        const reason = interaction.options.getString('reason');
+        const order = await Order.findOne({ order_id: oid }); 
+        
+        if(!order) return interaction.reply({ embeds: [createEmbed("❌ Error", "Invalid ID.", ERROR_COLOR)], ephemeral: true });
+        
+        // RESTRAINT: Only allowed if pending or claimed.
+        if (['cooking', 'ready', 'delivered'].includes(order.status)) {
+            return interaction.reply({ embeds: [createEmbed("❌ Warning Blocked", "Order is already cooking or ready. Ask a Manager to use `/fdo`.", ERROR_COLOR)], ephemeral: true });
+        }
+
+        order.status = 'cancelled_warn'; 
+        await order.save(); 
+        updateMasterLog(oid);
+
+        const u = await User.findOne({ user_id: order.user_id }) || new User({ user_id: order.user_id });
+        
+        // Add Warning Record
+        u.warning_history.push({ reason: reason, moderator: interaction.user.username });
+        u.warnings += 1;
+
+        let banDuration = null;
+        if (u.warnings === 3) {
+            banDuration = "7 Days";
+            u.ban_expires_at = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+        } else if (u.warnings === 6) {
+            banDuration = "30 Days";
+            u.ban_expires_at = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+        } else if (u.warnings >= 9) {
+            banDuration = "Permanent";
+            u.is_banned = 1;
+        }
+
+        await u.save();
+        
+        const chan = client.channels.cache.get(CHANNELS.WARNING);
+        if(chan) chan.send({ embeds: [createEmbed("⚠️ User Warned", `**User:** <@${order.user_id}>\n**Reason:** ${reason}\n**Strikes:** ${u.warnings}`, ERROR_COLOR)] });
+
+        // LOGGING TO ADMIN CHANNEL
+        if (banDuration) {
+            const historyText = u.warning_history.map((w, i) => `${i+1}. ${w.reason} (Mod: ${w.moderator})`).join('\n').substring(0, 1000);
+            const log = createEmbed("🚫 User Banned", `**User:** <@${order.user_id}> (${order.user_id})\n**Duration:** ${banDuration}\n**Total Strikes:** ${u.warnings}`, ERROR_COLOR)
+                .addFields({ name: "Warning History", value: historyText || "No history found." });
+            await logToAdminChannel(log);
+        }
+
+        await interaction.reply({ embeds: [createEmbed("✅ Action Taken", `User warned. Order removed. Total strikes: ${u.warnings}`, SUCCESS_COLOR)] });
+    }
+
+    // --- FDO (MANAGER ONLY - BEFORE DELIVERY) ---
+    if (commandName === 'fdo') {
+        if(!perms.isManager) return interaction.reply({ embeds: [createEmbed("❌ Access Denied", "Managers only.", ERROR_COLOR)], ephemeral: true });
+        
+        const oid = interaction.options.getString('id'); 
+        const reason = interaction.options.getString('reason');
+        const order = await Order.findOne({ order_id: oid }); 
+        
+        if(!order) return interaction.reply({ embeds: [createEmbed("❌ Error", "Invalid ID.", ERROR_COLOR)], ephemeral: true });
+        
+        // RESTRAINT: Only allowed if NOT delivered.
+        if (order.status === 'delivered') {
+            return interaction.reply({ embeds: [createEmbed("❌ Error", "Cannot force delete a delivered order. Use `/force_warn` instead.", ERROR_COLOR)], ephemeral: true });
+        }
+
+        order.status = 'cancelled_fdo'; 
+        await order.save(); 
+        updateMasterLog(oid);
+
+        const u = await User.findOne({ user_id: order.user_id }) || new User({ user_id: order.user_id });
+        
+        // Add Warning Record
+        u.warning_history.push({ reason: reason, moderator: interaction.user.username });
+        u.warnings += 1;
+
+        let banDuration = null;
+        if (u.warnings === 3) {
+            banDuration = "7 Days";
+            u.ban_expires_at = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+        } else if (u.warnings === 6) {
+            banDuration = "30 Days";
+            u.ban_expires_at = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+        } else if (u.warnings >= 9) {
+            banDuration = "Permanent";
+            u.is_banned = 1;
+        }
+
+        await u.save();
+        
+        const chan = client.channels.cache.get(CHANNELS.WARNING);
+        if(chan) chan.send({ embeds: [createEmbed("⚠️ User Warned (FDO)", `**User:** <@${order.user_id}>\n**Reason:** ${reason}\n**Strikes:** ${u.warnings}`, ERROR_COLOR)] });
+
+        // LOGGING TO ADMIN CHANNEL
+        if (banDuration) {
+            const historyText = u.warning_history.map((w, i) => `${i+1}. ${w.reason} (Mod: ${w.moderator})`).join('\n').substring(0, 1000);
+            const log = createEmbed("🚫 User Banned", `**User:** <@${order.user_id}> (${order.user_id})\n**Duration:** ${banDuration}\n**Total Strikes:** ${u.warnings}`, ERROR_COLOR)
+                .addFields({ name: "Warning History", value: historyText || "No history found." });
+            await logToAdminChannel(log);
+        }
+
+        await interaction.reply({ embeds: [createEmbed("✅ Action Taken", `Order force deleted & User warned. Total strikes: ${u.warnings}`, SUCCESS_COLOR)] });
+    }
+
+    // --- FORCE WARN (MANAGER ONLY - POST DELIVERY) ---
+    if (commandName === 'force_warn') {
+        if(!perms.isManager) return interaction.reply({ embeds: [createEmbed("❌ Access Denied", "Managers only.", ERROR_COLOR)], ephemeral: true });
+        
+        const oid = interaction.options.getString('id'); 
+        const reason = interaction.options.getString('reason');
+        const order = await Order.findOne({ order_id: oid }); 
+        
+        if(!order) return interaction.reply({ embeds: [createEmbed("❌ Error", "Invalid ID.", ERROR_COLOR)], ephemeral: true });
+        
+        // This command DOES NOT change order status. It only warns the user.
+
+        const u = await User.findOne({ user_id: order.user_id }) || new User({ user_id: order.user_id });
+        
+        // Add Warning Record
+        u.warning_history.push({ reason: reason, moderator: interaction.user.username });
+        u.warnings += 1;
+
+        let banDuration = null;
+        if (u.warnings === 3) {
+            banDuration = "7 Days";
+            u.ban_expires_at = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+        } else if (u.warnings === 6) {
+            banDuration = "30 Days";
+            u.ban_expires_at = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+        } else if (u.warnings >= 9) {
+            banDuration = "Permanent";
+            u.is_banned = 1;
+        }
+
+        await u.save();
+        
+        const chan = client.channels.cache.get(CHANNELS.WARNING);
+        if(chan) chan.send({ embeds: [createEmbed("⚠️ User Warned (Post-Delivery)", `**User:** <@${order.user_id}>\n**Reason:** ${reason}\n**Strikes:** ${u.warnings}`, ERROR_COLOR)] });
+
+        // LOGGING TO ADMIN CHANNEL
+        if (banDuration) {
+            const historyText = u.warning_history.map((w, i) => `${i+1}. ${w.reason} (Mod: ${w.moderator})`).join('\n').substring(0, 1000);
+            const log = createEmbed("🚫 User Banned", `**User:** <@${order.user_id}> (${order.user_id})\n**Duration:** ${banDuration}\n**Total Strikes:** ${u.warnings}`, ERROR_COLOR)
+                .addFields({ name: "Warning History", value: historyText || "No history found." });
+            await logToAdminChannel(log);
+        }
+
+        await interaction.reply({ embeds: [createEmbed("✅ Action Taken", `User warned (Post-Delivery). Total strikes: ${u.warnings}`, SUCCESS_COLOR)] });
+    }
+
+    if (commandName === 'unban') {
+        if(!perms.isManager) return interaction.reply({ embeds: [createEmbed("❌ Denied", "Managers only.", ERROR_COLOR)], ephemeral: true });
         const target = interaction.options.getUser('user');
-        await PremiumUser.findOneAndUpdate({ user_id: target.id }, { is_vip: false, expires_at: null });
-        try { (await client.guilds.cache.get(SUPPORT_SERVER_ID).members.fetch(target.id)).roles.remove(ROLES.VIP); } catch(e){}
-        await interaction.reply({ embeds: [createEmbed("📉 VIP Removed", `${target.username} lost VIP status.`, SUCCESS_COLOR)] });
+        
+        await User.findOneAndUpdate({ user_id: target.id }, { is_banned: 0, warnings: 0, ban_expires_at: null });
+        
+        const log = createEmbed("✅ User Unbanned", `**User:** ${target.tag} (${target.id})\n**Admin:** ${interaction.user.username}`, SUCCESS_COLOR);
+        await logToAdminChannel(log);
+
+        await interaction.reply({ embeds: [createEmbed("✅ Unbanned", `${target.username} is no longer banned.`, SUCCESS_COLOR)] });
+    }
+
+    // --- OTHER COMMANDS ---
+    if (commandName === 'runquota') {
+        if(!perms.isManager) return interaction.reply({ embeds: [createEmbed("❌ Denied", "Managers only.", ERROR_COLOR)], ephemeral: true });
+        await interaction.deferReply({ ephemeral: true }); await runQuotaLogic(interaction.guild); 
+        await interaction.editReply({ embeds: [createEmbed("✅ Quota Run", "Weekly quota check forced successfully.", SUCCESS_COLOR)] });
+    }
+
+    if (commandName === 'rules') {
+        const embed = createEmbed(`${BRAND_NAME} Rules`, "", BRAND_COLOR, [
+            { name: "1. The Golden Rule", value: "**Every order MUST include a Desert.**" },
+            { name: "2. Conduct", value: "No NSFW content in orders or images." },
+            { name: "3. Queue", value: "One active order at a time per user." },
+            { name: "4. Max Items", value: "Maximum 3 items per order." }
+        ]);
+        await interaction.reply({ embeds: [embed] });
+    }
+
+    if (commandName === 'complain') {
+        const oid = interaction.options.getString('id'); const reason = interaction.options.getString('reason');
+        const order = await Order.findOne({ order_id: oid }); if(!order) return interaction.reply({ embeds: [createEmbed("❌ Error", "Invalid Order ID.", ERROR_COLOR)], ephemeral: true });
+        const chan = client.channels.cache.get(CHANNELS.COMPLAINT); 
+        if(chan) chan.send({ embeds: [createEmbed("🚨 New Complaint", `**Order:** \`${oid}\`\n**User:** <@${interaction.user.id}>\n**Reason:** ${reason}`, ERROR_COLOR)] });
+        await interaction.reply({ embeds: [createEmbed("✅ Sent", "Your complaint has been sent to management.", SUCCESS_COLOR)], ephemeral: true });
     }
 
     if (commandName === 'orderlist') {
@@ -817,68 +1112,6 @@ client.on('interactionCreate', async interaction => {
         if(order.chef_name !== interaction.user.username && !perms.isManager) return interaction.reply({ embeds: [createEmbed("❌ Error", "You did not claim this order.", ERROR_COLOR)], ephemeral: true });
         order.status = 'pending'; order.chef_name = null; await order.save(); updateMasterLog(oid); 
         await interaction.reply({ embeds: [createEmbed("🔓 Unclaimed", `Order \`${oid}\` has been released.`, SUCCESS_COLOR)] });
-    }
-
-    if (commandName === 'warn' || commandName === 'fdo') {
-        if(!perms.isManager) return interaction.reply({ embeds: [createEmbed("❌ Access Denied", "Managers only.", ERROR_COLOR)], ephemeral: true });
-        const oid = interaction.options.getString('id'); const reason = interaction.options.getString('reason');
-        const order = await Order.findOne({ order_id: oid }); if(!order) return interaction.reply({ embeds: [createEmbed("❌ Error", "Invalid ID.", ERROR_COLOR)], ephemeral: true });
-        order.status = commandName === 'fdo' ? 'cancelled_fdo' : 'cancelled_warn'; await order.save(); updateMasterLog(oid);
-        const u = await User.findOneAndUpdate({ user_id: order.user_id }, { $inc: { warnings: 1 } }, { new: true, upsert: true });
-        if(u.warnings >= 3) { u.is_banned = 1; await u.save(); }
-        
-        const chan = client.channels.cache.get(CHANNELS.WARNING);
-        if(chan) chan.send({ embeds: [createEmbed("⚠️ User Warned", `**User:** <@${order.user_id}>\n**Reason:** ${reason}\n**Strikes:** ${u.warnings}`, ERROR_COLOR)] });
-        await interaction.reply({ embeds: [createEmbed("✅ Action Taken", `User warned. Total strikes: ${u.warnings}`, SUCCESS_COLOR)] });
-    }
-
-    if (commandName === 'runquota') {
-        if(!perms.isManager) return interaction.reply({ embeds: [createEmbed("❌ Denied", "Managers only.", ERROR_COLOR)], ephemeral: true });
-        await interaction.deferReply({ ephemeral: true }); await runQuotaLogic(interaction.guild); 
-        await interaction.editReply({ embeds: [createEmbed("✅ Quota Run", "Weekly quota check forced successfully.", SUCCESS_COLOR)] });
-    }
-
-    if (commandName === 'rules') {
-        const embed = createEmbed(`${BRAND_NAME} Rules`, "", BRAND_COLOR, [
-            { name: "1. The Golden Rule", value: "**Every order MUST include a donut.**" },
-            { name: "2. Conduct", value: "No NSFW content in orders or images." },
-            { name: "3. Queue", value: "One active order at a time per user." },
-            { name: "4. Max Items", value: "Maximum 3 items per order." }
-        ]);
-        await interaction.reply({ embeds: [embed] });
-    }
-
-    if (commandName === 'complain') {
-        const oid = interaction.options.getString('id'); const reason = interaction.options.getString('reason');
-        const order = await Order.findOne({ order_id: oid }); if(!order) return interaction.reply({ embeds: [createEmbed("❌ Error", "Invalid Order ID.", ERROR_COLOR)], ephemeral: true });
-        const chan = client.channels.cache.get(CHANNELS.COMPLAINT); 
-        if(chan) chan.send({ embeds: [createEmbed("🚨 New Complaint", `**Order:** \`${oid}\`\n**User:** <@${interaction.user.id}>\n**Reason:** ${reason}`, ERROR_COLOR)] });
-        await interaction.reply({ embeds: [createEmbed("✅ Sent", "Your complaint has been sent to management.", SUCCESS_COLOR)], ephemeral: true });
-    }
-
-    if (commandName === 'unban') {
-        if(!perms.isManager) return interaction.reply({ embeds: [createEmbed("❌ Denied", "Managers only.", ERROR_COLOR)], ephemeral: true });
-        const target = interaction.options.getUser('user');
-        await User.findOneAndUpdate({ user_id: target.id }, { is_banned: 0, warnings: 0 });
-        await interaction.reply({ embeds: [createEmbed("✅ Unbanned", `${target.username} is no longer banned.`, SUCCESS_COLOR)] });
-    }
-
-    if (commandName === 'vacation') {
-        if (!perms.isStaff) return interaction.reply({ embeds: [createEmbed("❌ Denied", "Staff only.", ERROR_COLOR)], ephemeral: true });
-        const days = interaction.options.getInteger('days'); const reason = interaction.options.getString('reason');
-        if (days < 1 || days > 14) return interaction.reply({ embeds: [createEmbed("❌ Error", "Days must be 1-14.", ERROR_COLOR)], ephemeral: true });
-        
-        const channel = client.channels.cache.get(CHANNELS.VACATION);
-        if(channel) {
-            const embed = createEmbed("🌴 Vacation Request", `**Staff:** <@${interaction.user.id}>\n**Duration:** ${days} Days\n**Reason:** ${reason}`, 0x1ABC9C);
-            const row = new ActionRowBuilder().addComponents(
-                new ButtonBuilder().setCustomId(`vacApprove_${interaction.user.id}_${days}`).setLabel('Approve').setStyle(ButtonStyle.Success),
-                new ButtonBuilder().setCustomId(`vacEdit_${interaction.user.id}`).setLabel('Edit Duration').setStyle(ButtonStyle.Primary),
-                new ButtonBuilder().setCustomId(`vacDeny_${interaction.user.id}`).setLabel('Deny').setStyle(ButtonStyle.Danger)
-            );
-            channel.send({ embeds: [embed], components: [row] });
-        }
-        await interaction.reply({ embeds: [createEmbed("✅ Request Sent", "Management will review your request.", SUCCESS_COLOR)] });
     }
 });
 
