@@ -217,7 +217,6 @@ async function applyWarningLogic(user, reason) {
 }
 
 async function executeQuotaRun(interaction = null) {
-    if (interaction) await interaction.deferReply();
     const users = await User.find({ $or: [{ cook_count_week: { $gt: 0 } }, { deliver_count_week: { $gt: 0 } }] });
     const topStaff = [...users].sort((a, b) => (b.cook_count_week + b.deliver_count_week) - (a.cook_count_week + a.deliver_count_week)).slice(0, 5);
     const totalWork = users.reduce((acc, u) => acc + u.deliver_count_week + u.cook_count_week, 0);
@@ -237,7 +236,6 @@ async function executeQuotaRun(interaction = null) {
     }
     const leaders = topStaff.map((u, i) => `\`#${i+1}\` <@${u.user_id}>: **${u.cook_count_week + u.deliver_count_week}**`).join('\n') || "None.";
     client.channels.cache.get(CHAN_QUOTA)?.send({ content: "@here 📢 **WEEKLY AUDIT**", embeds: [createEmbed("📊 Top Performers", leaders, COLOR_MAIN)] });
-    if (interaction) return interaction.editReply({ embeds: [createEmbed("✅ Audit Complete", "Weekly quota run finalized.", COLOR_SUCCESS)] });
 }
 
 async function updateOrderArchive(orderId) {
@@ -309,32 +307,26 @@ client.on('interactionCreate', async (interaction) => {
         const { commandName, options } = interaction;
         const userData = await User.findOne({ user_id: interaction.user.id }) || new User({ user_id: interaction.user.id });
 
-        // GATES: BANS & SERVER BLACKLIST
+        // GATES
         if (userData.is_perm_banned || (userData.service_ban_until > Date.now())) {
-            return interaction.reply({ 
-                embeds: [createEmbed("❌ Access Denied", `You are currently banned from Sugar Rush.\n\n**Appeal:** Join the [Support Server](${CONF_SUPPORT_SERVER}) OR DM this bot to open a ticket.`, COLOR_FAIL)], 
-                ephemeral: true 
-            });
+            return interaction.reply({ embeds: [createEmbed("❌ Access Denied", `You are currently banned.`, COLOR_FAIL)], ephemeral: true });
         }
         
         const isServerBlacklisted = await ServerBlacklist.findOne({ guild_id: interaction.guildId });
         if (isServerBlacklisted) {
-            return interaction.reply({ 
-                embeds: [createEmbed("❌ Server Blacklisted", `**Reason:** ${isServerBlacklisted.reason}\n\n**Appeal:** Join the [Support Server](${CONF_SUPPORT_SERVER}) OR DM this bot to open a ticket.`, COLOR_FAIL)], 
-                ephemeral: true 
-            });
+            return interaction.reply({ embeds: [createEmbed("❌ Server Blacklisted", `**Reason:** ${isServerBlacklisted.reason}`, COLOR_FAIL)], ephemeral: true });
         }
 
-        // COMMAND HANDLERS
+        // HELP
         if (commandName === 'help') {
             const fields = [
                 { name: "🛡️ Management", value: "`/generate_codes`, `/fdo`, `/force_warn`, `/run_quota`, `/ban`, `/unban`, `/refund`, `/serverblacklist`, `/unserverblacklist`" },
                 { name: "💰 Economy", value: "`/balance`, `/daily`, `/tip`, `/redeem`, `/premium`" },
-                { name: "📦 Ordering", value: "`/order`, `/super_order`, `/orderstatus`, `/orderinfo`, `/oinfo`, `/rate`, `/review`" },
+                { name: "📦 Ordering", value: "`/order`, `/super_order`, `/orderstatus`, `/orderinfo`, `/rate`, `/review`" },
                 { name: "👨‍🍳 Staff", value: "`/claim`, `/cook`, `/orderlist`, `/deliver`, `/deliverylist`, `/setscript`, `/stats`, `/vacation`, `/staff_buy`" },
                 { name: "🔗 Utility", value: "`/help`, `/invite`, `/support`, `/rules`, `/warn`" }
             ];
-            return interaction.reply({ embeds: [createEmbed("📖 Sugar Rush Directory", "Complete Command Protocol", COLOR_MAIN, fields)] });
+            return interaction.reply({ embeds: [createEmbed("📖 Sugar Rush Directory", "Complete Protocol", COLOR_MAIN, fields)] });
         }
 
         if (commandName === 'generate_codes') {
@@ -406,7 +398,7 @@ client.on('interactionCreate', async (interaction) => {
         }
 
         if (commandName === 'tip') {
-            const o = await Order.findOne({ order_id: options.getString('order_id') });
+            const o = await Order.findOne({ order_id: options.getString('id') });
             if (!o) return interaction.reply({ embeds: [createEmbed("❌ Error", "Order not found.", COLOR_FAIL)] });
             const amt = options.getInteger('amount');
             if (userData.balance < amt) return interaction.reply({ embeds: [createEmbed("❌ Error", "Insufficient balance.", COLOR_FAIL)] });
@@ -460,7 +452,7 @@ client.on('interactionCreate', async (interaction) => {
         if (commandName === 'rate') {
             const o = await Order.findOne({ order_id: options.getString('order_id') });
             if (!o) return interaction.reply({ embeds: [createEmbed("❌ Error", "Not found.", COLOR_FAIL)] });
-            o.rating = options.getInteger('stars'); o.rated = true; await o.save();
+            o.rating = options.getInteger('stars'); o.feedback = options.getString('feedback') || ""; o.rated = true; await o.save();
             return interaction.reply({ embeds: [createEmbed("⭐ Rated", "Thank you for your feedback!", COLOR_SUCCESS)] });
         }
 
@@ -495,12 +487,7 @@ client.on('interactionCreate', async (interaction) => {
                 await Order.findOneAndUpdate({ order_id: o.order_id }, { status: 'ready', ready_at: new Date() });
                 client.channels.cache.get(CHAN_DELIVERY).send({ embeds: [createEmbed("🥡 Order Ready", `ID: ${o.order_id}\nCustomer: <@${o.user_id}>`)] });
             }, 180000);
-            return interaction.reply({ embeds: [createEmbed("♨️ Cooking", `Started. Proofs: ${proofs.length}`)] });
-        }
-
-        if (commandName === 'orderlist') {
-            const orders = await Order.find({ status: 'pending' });
-            return interaction.reply({ embeds: [createEmbed("📋 Kitchen Queue", orders.map(o => `• \`${o.order_id}\` | ${o.item}`).join('\n') || "Empty.")] });
+            return interaction.reply({ embeds: [createEmbed("♨️ Cooking", `Started timer (3m). Proofs: ${proofs.length}`)] });
         }
 
         if (commandName === 'deliver') {
@@ -514,8 +501,22 @@ client.on('interactionCreate', async (interaction) => {
                 const proofs = o.images?.length ? o.images.map((l, i) => `**Proof ${i+1}:** ${l}`).join('\n') : "None.";
                 const row = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`complete_${o.order_id}`).setLabel('Confirm Delivery').setStyle(ButtonStyle.Success));
                 await interaction.user.send({ content: `**📦 DISPATCH**\n\n**Dest:** ${inv.url}\n**User:** <@${o.user_id}>\n\n**🍳 PROOFS:**\n${proofs}`, components: [row] });
+                
+                // 5 MINUTE TIMEOUT
+                setTimeout(async () => {
+                    const check = await Order.findOne({ order_id: o.order_id });
+                    if (check && check.status === 'delivering') {
+                        check.status = 'ready'; check.deliverer_id = null; await check.save();
+                    }
+                }, 300000);
+
                 return interaction.reply({ embeds: [createEmbed("📫 Dispatch", "Sent to DMs.", COLOR_SUCCESS)] });
             } catch (e) { return interaction.reply({ embeds: [createEmbed("❌ Failed", "Invite blocked. Ready for Auto-System.", COLOR_FAIL)] }); }
+        }
+
+        if (commandName === 'orderlist') {
+            const orders = await Order.find({ status: 'pending' });
+            return interaction.reply({ embeds: [createEmbed("📋 Kitchen Queue", orders.map(o => `• \`${o.order_id}\` | ${o.item}`).join('\n') || "Empty.")] });
         }
 
         if (commandName === 'deliverylist') {
@@ -545,7 +546,10 @@ client.on('interactionCreate', async (interaction) => {
             return interaction.reply({ embeds: [createEmbed("✅ Upgraded", "Double Stats active (30d).", COLOR_SUCCESS)] });
         }
 
-        if (commandName === 'invite') return interaction.reply({ embeds: [createEmbed("🤖 Invite", `https://discord.com/api/oauth2/authorize?client_id=${client.user.id}&permissions=139586817088&scope=bot%20applications.commands`)] });
+        if (commandName === 'invite') {
+            const link = `https://discord.com/api/oauth2/authorize?client_id=${client.user.id}&permissions=274878024769&scope=bot%20applications.commands`;
+            return interaction.reply({ embeds: [createEmbed("🤖 Invite", `[Invite Sugar Rush](${link})`)] });
+        }
         if (commandName === 'support') return interaction.reply({ embeds: [createEmbed("🆘 Support", CONF_SUPPORT_SERVER)] });
         if (commandName === 'rules') return interaction.reply({ embeds: [createEmbed("📖 Rules", await fetchRules())] });
         if (commandName === 'run_quota') { if (!interaction.member.roles.cache.has(ROLE_MANAGER)) return interaction.reply({ embeds: [createEmbed("❌ Denied", "Unauthorized.", COLOR_FAIL)] }); await executeQuotaRun(); return interaction.reply({ embeds: [createEmbed("✅ Audit", "Audit complete.", COLOR_SUCCESS)] }); }
@@ -587,7 +591,7 @@ client.on('ready', async () => {
         { name: 'orderstatus', description: 'Check status' },
         { name: 'orderinfo', description: 'Check info', options: [{ name: 'id', type: 3, description: 'Order ID', required: true }] },
         { name: 'oinfo', description: 'Check info alias', options: [{ name: 'id', type: 3, description: 'Order ID', required: true }] },
-        { name: 'rate', description: 'Rate order', options: [{ name: 'order_id', type: 3, description: 'Order ID', required: true }, { name: 'stars', type: 4, description: 'Stars', required: true }] },
+        { name: 'rate', description: 'Rate order', options: [{ name: 'id', type: 3, description: 'Order ID', required: true }, { name: 'stars', type: 4, description: 'Stars', required: true }, { name: 'feedback', type: 3, description: 'Feedback', required: false }] },
         { name: 'review', description: 'Leave review', options: [{ name: 'rating', type: 4, description: 'Rating', required: true }, { name: 'comment', type: 3, description: 'Message', required: true }] },
         { name: 'claim', description: 'Claim order', options: [{ name: 'id', type: 3, description: 'Order ID', required: true }] },
         { name: 'cook', description: 'Cook order', options: [{ name: 'id', type: 3, description: 'Order ID', required: true }, { name: 'image', type: 11, description: 'Proof 1', required: true }, { name: 'image2', type: 11, description: 'Proof 2', required: false }, { name: 'image3', type: 11, description: 'Proof 3', required: false }] },
@@ -608,11 +612,10 @@ client.on('ready', async () => {
     setInterval(async () => {
         try {
             const now = new Date();
-            if (now.getDay() === 0 && now.getHours() === 0 && now.getMinutes() === 0) await executeQuotaRun();
+            if (now.getDay() === 0 && now.getHours() === 0 && now.getMinutes() === 0) await executeQuotaRun(null);
 
             const serverCount = client.guilds.cache.size;
             const totalUsers = client.guilds.cache.reduce((acc, guild) => acc + guild.memberCount, 0);
-            const pendingCount = await Order.countDocuments({ status: 'pending' });
 
             const statuses = [
                 { name: `Total Servers: ${serverCount}`, type: ActivityType.Watching },
