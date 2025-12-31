@@ -270,13 +270,7 @@ async function updateOrderArchive(orderId) {
 }
 
 // ============================================================================
-// [4] MAINTENANCE & REVOLVING STATUS
-// ============================================================================
-
-let statusIndex = 0;
-
-// ============================================================================
-// [5] INTERACTION ROUTER
+// [4] INTERACTION ROUTER
 // ============================================================================
 
 const client = new Client({
@@ -331,7 +325,7 @@ client.on('interactionCreate', async (interaction) => {
             });
         }
 
-        // [8] HELP
+        // COMMAND HANDLERS
         if (commandName === 'help') {
             const fields = [
                 { name: "🛡️ Management", value: "`/generate_codes`, `/fdo`, `/force_warn`, `/run_quota`, `/ban`, `/unban`, `/refund`, `/serverblacklist`, `/unserverblacklist`" },
@@ -343,7 +337,6 @@ client.on('interactionCreate', async (interaction) => {
             return interaction.reply({ embeds: [createEmbed("📖 Sugar Rush Directory", "Complete Command Protocol", COLOR_MAIN, fields)] });
         }
 
-        // [1, 2] SYSTEM & DISCIPLINE
         if (commandName === 'generate_codes') {
             if (interaction.user.id !== CONF_OWNER) return interaction.reply({ embeds: [createEmbed("❌ Unauthorized", "Owner Only.", COLOR_FAIL)] });
             const amt = options.getInteger('amount');
@@ -379,7 +372,7 @@ client.on('interactionCreate', async (interaction) => {
             
             const target = await User.findOne({ user_id: o.user_id }) || new User({ user_id: o.user_id });
             const pen = await applyWarningLogic(target, options.getString('reason'));
-            if (commandName === 'warn') o.status = 'cancelled_warn'; if (commandName === 'fdo') o.status = 'cancelled_fdo'; await o.save();
+            o.status = commandName === 'warn' ? 'cancelled_warn' : 'cancelled_fdo'; await o.save();
             return interaction.reply({ embeds: [createEmbed("✅ Action Logged", `Penalty: ${pen}`, COLOR_SUCCESS)] });
         }
 
@@ -398,14 +391,13 @@ client.on('interactionCreate', async (interaction) => {
         if (commandName === 'refund') {
             if (!interaction.member.roles.cache.has(ROLE_MANAGER)) return interaction.reply({ embeds: [createEmbed("❌ Denied", "Management Only.", COLOR_FAIL)] });
             const o = await Order.findOne({ order_id: options.getString('id') });
-            await User.findOneAndUpdate({ user_id: o.user_id }, { $inc: { balance: 100 } });
+            if (o) await User.findOneAndUpdate({ user_id: o.user_id }, { $inc: { balance: 100 } });
             o.status = 'refunded'; await o.save();
             return interaction.reply({ embeds: [createEmbed("✅ Refunded", "Order refunded successfully.", COLOR_SUCCESS)] });
         }
 
-        // [3, 4] ECONOMY & ORDERING
         if (commandName === 'balance') return interaction.reply({ embeds: [createEmbed("💰 Vault", `Balance: **${userData.balance} Sugar Coins**`)] });
-        
+
         if (commandName === 'daily') {
             if (Date.now() - userData.last_daily < 86400000) return interaction.reply({ embeds: [createEmbed("⏰ Cooldown", "Please wait 24h.", COLOR_FAIL)] });
             const pay = userData.vip_until > Date.now() ? 2000 : 1000;
@@ -414,68 +406,44 @@ client.on('interactionCreate', async (interaction) => {
         }
 
         if (commandName === 'tip') {
-            const amt = options.getInteger('amount');
             const o = await Order.findOne({ order_id: options.getString('order_id') });
+            if (!o) return interaction.reply({ embeds: [createEmbed("❌ Error", "Order not found.", COLOR_FAIL)] });
+            const amt = options.getInteger('amount');
+            if (userData.balance < amt) return interaction.reply({ embeds: [createEmbed("❌ Error", "Insufficient balance.", COLOR_FAIL)] });
             userData.balance -= amt; await userData.save();
-            await User.findOneAndUpdate({ user_id: o.chef_id }, { $inc: { balance: amt } });
-            return interaction.reply({ embeds: [createEmbed("💸 Tipped", "Tip sent to staff.", COLOR_SUCCESS)] });
+            if (o.chef_id) await User.findOneAndUpdate({ user_id: o.chef_id }, { $inc: { balance: amt } });
+            return interaction.reply({ embeds: [createEmbed("💸 Tipped", `${amt} Sugar Coins sent to staff.`, COLOR_SUCCESS)] });
         }
 
         if (commandName === 'redeem') {
             const code = await VIPCode.findOne({ code: options.getString('code'), is_used: false });
             if (!code) return interaction.reply({ embeds: [createEmbed("❌ Invalid Code", "This code is invalid or has already been used.", COLOR_FAIL)], ephemeral: true });
-            
             const now = new Date();
-            const add = 30 * 86400000;
             const current = userData.vip_until > now ? userData.vip_until.getTime() : now.getTime();
-            userData.vip_until = new Date(current + add);
-            
-            code.is_used = true; 
-            await userData.save(); 
-            await code.save();
-            
-            return interaction.reply({ embeds: [createEmbed("💎 VIP Redeemed", `**Status Active Until:** ${userData.vip_until.toDateString()}\n\nThank you for your support!`, COLOR_VIP)] });
+            userData.vip_until = new Date(current + (30 * 86400000));
+            code.is_used = true; await code.save(); await userData.save();
+            return interaction.reply({ embeds: [createEmbed("💎 VIP Redeemed", `**Status Active Until:** ${userData.vip_until.toDateString()}`, COLOR_VIP)] });
         }
 
-        if (commandName === 'premium') {
-            return interaction.reply({ embeds: [createEmbed("💎 Premium Store", `**[Click to Visit Shop](${CONF_STORE})**\n\n• 50% Off Orders\n• 2x Daily Rewards\n• Gold Profile Status`, COLOR_VIP)] });
-        }
+        if (commandName === 'premium') return interaction.reply({ embeds: [createEmbed("💎 Premium Store", `**[Click to Visit Shop](${CONF_STORE})**`, COLOR_VIP)] });
 
         if (commandName === 'order' || commandName === 'super_order') {
             const isVip = userData.vip_until > Date.now();
-            let cost = (commandName === 'super_order' ? 150 : 100);
-            if (isVip) cost = Math.ceil(cost * 0.5);
-            
+            let cost = commandName === 'super_order' ? 150 : 100; if (isVip) cost = Math.ceil(cost * 0.5);
             if (userData.balance < cost) return interaction.reply({ embeds: [createEmbed("❌ Insufficient Funds", `Need ${cost} Sugar Coins.`, COLOR_FAIL)] });
-            
-            const activeCount = await Order.countDocuments({ user_id: interaction.user.id, status: { $in: ['pending', 'claimed', 'cooking', 'ready'] } });
-            if (activeCount >= 3) return interaction.reply({ embeds: [createEmbed("❌ Limit Reached", "You have 3 active orders.", COLOR_FAIL)] });
-
+            const count = await Order.countDocuments({ user_id: interaction.user.id, status: { $in: ['pending', 'claimed', 'cooking', 'ready'] } });
+            if (count >= 3) return interaction.reply({ embeds: [createEmbed("❌ Limit", "3 active orders max.", COLOR_FAIL)] });
             const oid = Math.random().toString(36).substring(2, 8).toUpperCase();
-            
-            let kitchenMsgId = null;
-            let title = "🍩 New Order", col = COLOR_MAIN, content = null, recTitle = "✅ Order Authorized";
-            if (commandName === 'super_order') { title = "🚀 SUPER ORDER"; col = COLOR_FAIL; content = "@here 🚀 **PRIORITY**"; recTitle = "🚀 Priority Order Confirmed"; }
-            else if (isVip) { title = "👑 VIP Order"; col = COLOR_VIP; recTitle = "👑 VIP Order Authorized"; }
-
             const cookChan = client.channels.cache.get(CHAN_COOK);
+            let kitchenMsgId = null;
             if (cookChan) {
-                const msg = await cookChan.send({ content: content, embeds: [createEmbed(title, `ID: ${oid}\nItem: ${options.getString('item')}`, col)] });
+                const msg = await cookChan.send({ content: commandName === 'super_order' ? "@here 🚀 **PRIORITY**" : null, embeds: [createEmbed(commandName === 'super_order' ? "🚀 SUPER ORDER" : "🍩 New Order", `ID: ${oid}\nItem: ${options.getString('item')}`)] });
                 kitchenMsgId = msg.id;
             }
-
             await new Order({ order_id: oid, user_id: interaction.user.id, guild_id: interaction.guildId, channel_id: interaction.channelId, item: options.getString('item'), is_vip: isVip, is_super: commandName === 'super_order', kitchen_msg_id: kitchenMsgId }).save();
             userData.balance -= cost; await userData.save();
-
-            const fields = [
-                { name: "Order ID", value: `\`${oid}\``, inline: true },
-                { name: "Item", value: options.getString('item'), inline: true },
-                { name: "Cost", value: `${cost} Sugar Coins`, inline: true },
-                { name: "Status", value: "PENDING", inline: true }
-            ];
-            
             updateOrderArchive(oid);
-            return interaction.reply({ embeds: [createEmbed(recTitle, "Thank you for choosing Sugar Rush. Your order has been sent to the kitchen.", col, fields)] });
+            return interaction.reply({ embeds: [createEmbed("✅ Authorized", "Sent to kitchen.", COLOR_SUCCESS)] });
         }
 
         if (commandName === 'orderstatus') {
@@ -485,11 +453,13 @@ client.on('interactionCreate', async (interaction) => {
 
         if (commandName === 'orderinfo' || commandName === 'oinfo') {
             const o = await Order.findOne({ order_id: options.getString('id') });
+            if (!o) return interaction.reply({ embeds: [createEmbed("❌ Error", "Not found.", COLOR_FAIL)] });
             return interaction.reply({ embeds: [createEmbed(`Info: ${o.order_id}`, `Item: ${o.item}\nStatus: ${o.status.toUpperCase()}`)] });
         }
 
         if (commandName === 'rate') {
             const o = await Order.findOne({ order_id: options.getString('order_id') });
+            if (!o) return interaction.reply({ embeds: [createEmbed("❌ Error", "Not found.", COLOR_FAIL)] });
             o.rating = options.getInteger('stars'); o.rated = true; await o.save();
             return interaction.reply({ embeds: [createEmbed("⭐ Rated", "Thank you for your feedback!", COLOR_SUCCESS)] });
         }
@@ -499,113 +469,63 @@ client.on('interactionCreate', async (interaction) => {
             return interaction.reply({ embeds: [createEmbed("✅ Submitted", "Review published.", COLOR_SUCCESS)] });
         }
 
-        // [5, 6, 7] STAFF
         if (commandName === 'claim') {
             if (!interaction.member.roles.cache.has(ROLE_COOK)) return interaction.reply({ embeds: [createEmbed("❌ Denied", "Cooks only.", COLOR_FAIL)] });
             const o = await Order.findOne({ order_id: options.getString('id'), status: 'pending' });
-            if (!o) return interaction.reply({ embeds: [createEmbed("❌ Error", "Invalid Order ID.", COLOR_FAIL)] });
-            
-            o.status = 'claimed'; 
-            o.chef_id = interaction.user.id; 
-            o.chef_name = interaction.user.username; 
-            await o.save();
-            
-            if (o.kitchen_msg_id) {
-                try {
-                    const chan = client.channels.cache.get(CHAN_COOK);
-                    const msg = await chan.messages.fetch(o.kitchen_msg_id);
-                    const oldEmbed = msg.embeds[0];
-                    const newEmbed = new EmbedBuilder(oldEmbed.data)
-                        .setTitle(`👨‍🍳 CLAIMED: ${oldEmbed.title}`) 
-                        .addFields({ name: 'Chef', value: `<@${interaction.user.id}>` })
-                        .setColor(COLOR_SUCCESS); 
-                    await msg.edit({ content: null, embeds: [newEmbed] });
-                } catch (e) {}
-            }
-            
+            if (!o) return interaction.reply({ embeds: [createEmbed("❌ Error", "Invalid ID.", COLOR_FAIL)] });
+            o.status = 'claimed'; o.chef_id = interaction.user.id; o.chef_name = interaction.user.username; await o.save();
             updateOrderArchive(o.order_id);
-
             setTimeout(async () => {
                 const check = await Order.findOne({ order_id: o.order_id });
-                if (check && check.status === 'claimed') {
-                    check.status = 'pending';
-                    check.chef_id = null;
-                    check.chef_name = null;
-                    await check.save();
-                    client.channels.cache.get(CHAN_COOK)?.send({ embeds: [createEmbed("⚠️ Claim Expired", `Order \`${check.order_id}\` is back in queue (5m Timeout).`, COLOR_FAIL)] });
-                }
+                if (check && check.status === 'claimed') { check.status = 'pending'; check.chef_id = null; await check.save(); }
             }, 300000);
-
-            return interaction.reply({ embeds: [createEmbed("👨‍🍳 Claimed", "Order assigned to you. You have 5 minutes to cook.", COLOR_SUCCESS)] });
+            return interaction.reply({ embeds: [createEmbed("👨‍🍳 Claimed", "Assigned to you.", COLOR_SUCCESS)] });
         }
 
         if (commandName === 'cook') {
             if (!interaction.member.roles.cache.has(ROLE_COOK)) return interaction.reply({ embeds: [createEmbed("❌ Denied", "Cooks only.", COLOR_FAIL)] });
-            
             const o = await Order.findOne({ order_id: options.getString('id'), status: 'claimed', chef_id: interaction.user.id });
-            if (!o) return interaction.reply({ embeds: [createEmbed("❌ Error", "Order not found or not claimed by you.", COLOR_FAIL)] });
-
+            if (!o) return interaction.reply({ embeds: [createEmbed("❌ Error", "Not claimed by you.", COLOR_FAIL)] });
             const proofs = [];
             if (options.getAttachment('image')) proofs.push(options.getAttachment('image').url);
-            if (options.getString('link')) proofs.push(options.getString('link'));
             if (options.getAttachment('image2')) proofs.push(options.getAttachment('image2').url);
-            if (options.getString('link2')) proofs.push(options.getString('link2'));
             if (options.getAttachment('image3')) proofs.push(options.getAttachment('image3').url);
-            if (options.getString('link3')) proofs.push(options.getString('link3'));
-
-            o.status = 'cooking'; 
-            o.images = proofs;
-            await o.save();
-
+            o.status = 'cooking'; o.images = proofs; await o.save();
             setTimeout(async () => {
                 await Order.findOneAndUpdate({ order_id: o.order_id }, { status: 'ready', ready_at: new Date() });
-                client.channels.cache.get(CHAN_DELIVERY).send({ embeds: [createEmbed("🥡 Order Ready", `**ID:** ${o.order_id}\n**Customer:** <@${o.user_id}>`, COLOR_MAIN)] });
+                client.channels.cache.get(CHAN_DELIVERY).send({ embeds: [createEmbed("🥡 Order Ready", `ID: ${o.order_id}\nCustomer: <@${o.user_id}>`)] });
             }, 180000);
-
-            return interaction.reply({ embeds: [createEmbed("♨️ Cooking", `Timer started (3m).\n**Proofs:** ${proofs.length}`, COLOR_MAIN)] });
+            return interaction.reply({ embeds: [createEmbed("♨️ Cooking", `Started. Proofs: ${proofs.length}`)] });
         }
 
         if (commandName === 'orderlist') {
-            if (!interaction.member.roles.cache.has(ROLE_COOK)) return interaction.reply({ embeds: [createEmbed("❌ Denied", "Cooks only.", COLOR_FAIL)] });
             const orders = await Order.find({ status: 'pending' });
             return interaction.reply({ embeds: [createEmbed("📋 Kitchen Queue", orders.map(o => `• \`${o.order_id}\` | ${o.item}`).join('\n') || "Empty.")] });
         }
 
         if (commandName === 'deliver') {
             if (!interaction.member.roles.cache.has(ROLE_DELIVERY)) return interaction.reply({ embeds: [createEmbed("❌ Denied", "Drivers only.", COLOR_FAIL)] });
-            
             const o = await Order.findOne({ order_id: options.getString('id'), status: 'ready' });
-            if (!o) return interaction.reply({ embeds: [createEmbed("❌ Error", "Order is not ready or valid.", COLOR_FAIL)] });
-            
+            if (!o) return interaction.reply({ embeds: [createEmbed("❌ Error", "Not ready.", COLOR_FAIL)] });
             try {
                 const guild = client.guilds.cache.get(o.guild_id);
-                const inv = await guild.channels.cache.random().createInvite(); 
-                
-                o.status = 'delivering'; 
-                o.deliverer_id = interaction.user.id; 
-                await o.save();
-                
+                const inv = await guild.channels.cache.random().createInvite();
+                o.status = 'delivering'; o.deliverer_id = interaction.user.id; await o.save();
+                const proofs = o.images?.length ? o.images.map((l, i) => `**Proof ${i+1}:** ${l}`).join('\n') : "None.";
                 const row = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`complete_${o.order_id}`).setLabel('Confirm Delivery').setStyle(ButtonStyle.Success));
-                const proofList = o.images && o.images.length > 0 ? o.images.map((l, i) => `**Proof ${i+1}:** ${l}`).join('\n') : "No proofs attached.";
-                
-                await interaction.user.send({ content: `**📦 DELIVERY DISPATCH**\n\n**Destination:** ${inv.url}\n**Customer:** <@${o.user_id}>\n\n**🍳 PROOFS:**\n${proofList}`, components: [row] }); 
-                
-                return interaction.reply({ embeds: [createEmbed("📫 Dispatch", "Briefing sent to DMs.", COLOR_SUCCESS)] });
-            } catch (e) {
-                return interaction.reply({ embeds: [createEmbed("❌ Dispatch Failed", "Invite creation blocked. Order left in 'Ready' state for Auto-System.", COLOR_FAIL)] });
-            }
+                await interaction.user.send({ content: `**📦 DISPATCH**\n\n**Dest:** ${inv.url}\n**User:** <@${o.user_id}>\n\n**🍳 PROOFS:**\n${proofs}`, components: [row] });
+                return interaction.reply({ embeds: [createEmbed("📫 Dispatch", "Sent to DMs.", COLOR_SUCCESS)] });
+            } catch (e) { return interaction.reply({ embeds: [createEmbed("❌ Failed", "Invite blocked. Ready for Auto-System.", COLOR_FAIL)] }); }
         }
 
         if (commandName === 'deliverylist') {
-            if (!interaction.member.roles.cache.has(ROLE_DELIVERY)) return interaction.reply({ embeds: [createEmbed("❌ Denied", "Drivers only.", COLOR_FAIL)] });
             const orders = await Order.find({ status: 'ready' });
             return interaction.reply({ embeds: [createEmbed("📦 Delivery Queue", orders.map(o => `• \`${o.order_id}\` | <@${o.user_id}>`).join('\n') || "Empty.")] });
         }
 
         if (commandName === 'setscript') {
-            if (!interaction.member.roles.cache.has(ROLE_DELIVERY)) return interaction.reply({ embeds: [createEmbed("❌ Denied", "Drivers only.", COLOR_FAIL)] });
             await Script.findOneAndUpdate({ user_id: interaction.user.id }, { script: options.getString('message') }, { upsert: true });
-            return interaction.reply({ embeds: [createEmbed("✅ Saved", "Delivery script updated.", COLOR_SUCCESS)] });
+            return interaction.reply({ embeds: [createEmbed("✅ Saved", "Script updated.", COLOR_SUCCESS)] });
         }
 
         if (commandName === 'stats') {
@@ -615,34 +535,35 @@ client.on('interactionCreate', async (interaction) => {
 
         if (commandName === 'vacation') {
             const row = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`approve_${interaction.user.id}`).setLabel('Approve').setStyle(ButtonStyle.Success));
-            client.channels.cache.get(CHAN_VACATION).send({ content: "Request", components: [row] });
-            return interaction.reply({ embeds: [createEmbed("✅ Request Sent", "Vacation request submitted.", COLOR_SUCCESS)] });
+            client.channels.cache.get(CHAN_VACATION).send({ content: "Vacation Request", components: [row] });
+            return interaction.reply({ embeds: [createEmbed("✅ Sent", "Request submitted.", COLOR_SUCCESS)] });
         }
 
         if (commandName === 'staff_buy') {
+            if (userData.balance < 15000) return interaction.reply({ embeds: [createEmbed("❌ Error", "Need 15k Coins.", COLOR_FAIL)] });
             userData.balance -= 15000; await userData.save();
-            return interaction.reply({ embeds: [createEmbed("✅ Upgraded", "Double Stats Active (30 Days).", COLOR_SUCCESS)] });
+            return interaction.reply({ embeds: [createEmbed("✅ Upgraded", "Double Stats active (30d).", COLOR_SUCCESS)] });
         }
 
-        // [8] UTILITY
-        if (commandName === 'run_quota') { if (!interaction.member.roles.cache.has(ROLE_MANAGER)) return interaction.reply({ embeds: [createEmbed("❌ Denied", "Unauthorized.", COLOR_FAIL)] }); await executeQuotaRun(); return interaction.reply({ embeds: [createEmbed("✅ Audit", "Audit complete.", COLOR_SUCCESS)] }); }
-        if (commandName === 'invite') {
-            const link = `https://discord.com/api/oauth2/authorize?client_id=${client.user.id}&permissions=117761&scope=bot%20applications.commands`;
-            return interaction.reply({ embeds: [createEmbed("🤖 Bot Invite", `[Click here to invite Sugar Rush](${link})`, COLOR_MAIN)] });
-        }
-        if (commandName === 'support') return interaction.reply({ embeds: [createEmbed("🆘 Support", CONF_SUPPORT_SERVER, COLOR_MAIN)] });
+        if (commandName === 'invite') return interaction.reply({ embeds: [createEmbed("🤖 Invite", `https://discord.com/api/oauth2/authorize?client_id=${client.user.id}&permissions=139586817088&scope=bot%20applications.commands`)] });
+        if (commandName === 'support') return interaction.reply({ embeds: [createEmbed("🆘 Support", CONF_SUPPORT_SERVER)] });
         if (commandName === 'rules') return interaction.reply({ embeds: [createEmbed("📖 Rules", await fetchRules())] });
-        
-    } catch (err) {
-        console.error("CRITICAL ERROR:", err);
-        if (!interaction.replied && !interaction.deferred) {
-            await interaction.reply({ content: "❌ System Error: The command failed. Check console.", ephemeral: true }).catch(() => {});
-        }
+        if (commandName === 'run_quota') { if (!interaction.member.roles.cache.has(ROLE_MANAGER)) return interaction.reply({ embeds: [createEmbed("❌ Denied", "Unauthorized.", COLOR_FAIL)] }); await executeQuotaRun(); return interaction.reply({ embeds: [createEmbed("✅ Audit", "Audit complete.", COLOR_SUCCESS)] }); }
+
+    } catch (e) { 
+        console.error(e); 
+        if (!interaction.replied) await interaction.reply({ content: "❌ System Error.", ephemeral: true }).catch(() => {});
     }
 });
 
-client.on('ready', async () => { 
-    mongoose.connect(CONF_MONGO); 
+// ============================================================================
+// [5] MAINTENANCE & STATUS
+// ============================================================================
+
+let statusIndex = 0;
+
+client.on('ready', async () => {
+    mongoose.connect(CONF_MONGO);
     console.log("Sugar Rush Build Online.");
     
     const commands = [
@@ -666,10 +587,10 @@ client.on('ready', async () => {
         { name: 'orderstatus', description: 'Check status' },
         { name: 'orderinfo', description: 'Check info', options: [{ name: 'id', type: 3, description: 'Order ID', required: true }] },
         { name: 'oinfo', description: 'Check info alias', options: [{ name: 'id', type: 3, description: 'Order ID', required: true }] },
-        { name: 'rate', description: 'Rate order', options: [{ name: 'order_id', type: 3, description: 'Order ID', required: true }, { name: 'stars', type: 4, description: 'Stars', required: true }, { name: 'feedback', type: 3, description: 'Feedback', required: false }] },
+        { name: 'rate', description: 'Rate order', options: [{ name: 'order_id', type: 3, description: 'Order ID', required: true }, { name: 'stars', type: 4, description: 'Stars', required: true }] },
         { name: 'review', description: 'Leave review', options: [{ name: 'rating', type: 4, description: 'Rating', required: true }, { name: 'comment', type: 3, description: 'Message', required: true }] },
         { name: 'claim', description: 'Claim order', options: [{ name: 'id', type: 3, description: 'Order ID', required: true }] },
-        { name: 'cook', description: 'Cook order', options: [{ name: 'id', type: 3, description: 'Order ID', required: true }, { name: 'image', type: 11, description: 'Order Item 1', required: true }, { name: 'image2', type: 11, description: 'Order Item 2', required: false }, { name: 'image3', type: 11, description: 'Order Item 3', required: false }] },
+        { name: 'cook', description: 'Cook order', options: [{ name: 'id', type: 3, description: 'Order ID', required: true }, { name: 'image', type: 11, description: 'Proof 1', required: true }, { name: 'image2', type: 11, description: 'Proof 2', required: false }, { name: 'image3', type: 11, description: 'Proof 3', required: false }] },
         { name: 'orderlist', description: 'View queue' },
         { name: 'deliver', description: 'Deliver order', options: [{ name: 'id', type: 3, description: 'Order ID', required: true }] },
         { name: 'deliverylist', description: 'View delivery queue' },
@@ -683,57 +604,39 @@ client.on('ready', async () => {
         { name: 'help', description: 'Get help directory' }
     ];
     await client.application.commands.set(commands);
-    console.log("Commands registered on Discord.");
-});
 
-setInterval(async () => { 
-    try {
-        const now = new Date(); 
-        
-        // Weekly Quota Run
-        if (now.getDay() === 0 && now.getHours() === 0 && now.getMinutes() === 0) {
-            await executeQuotaRun(null); 
-        }
+    setInterval(async () => {
+        try {
+            const now = new Date();
+            if (now.getDay() === 0 && now.getHours() === 0 && now.getMinutes() === 0) await executeQuotaRun();
 
-        // --- REVOLVING STATUS LOGIC ---
-        const serverCount = client.guilds.cache.size;
-        const totalUsers = client.guilds.cache.reduce((acc, guild) => acc + guild.memberCount, 0);
-        const statuses = [
-            { name: ` Total Servers: ${serverCount}`, type: ActivityType.Watching },
-            { name: `/order | Sugar Rush`, type: ActivityType.Playing },
-            { name: `Users: ${totalUsers}`, type: ActivityType.Playing }
-        ];
+            const serverCount = client.guilds.cache.size;
+            const totalUsers = client.guilds.cache.reduce((acc, guild) => acc + guild.memberCount, 0);
+            const pendingCount = await Order.countDocuments({ status: 'pending' });
 
-        client.user.setPresence({
-            activities: [statuses[statusIndex]],
-            status: 'online',
-        });
+            const statuses = [
+                { name: `Total Servers: ${serverCount}`, type: ActivityType.Watching },
+                { name: `/order | Sugar Rush`, type: ActivityType.Playing },
+                { name: `Users: ${totalUsers}`, type: ActivityType.Watching },
+                { name: `${pendingCount} orders in queue`, type: ActivityType.Watching }
+            ];
 
-        statusIndex = (statusIndex + 1) % statuses.length;
+            client.user.setPresence({ activities: [statuses[statusIndex]], status: 'online' });
+            statusIndex = (statusIndex + 1) % statuses.length;
 
-        // --- AUTO-DELIVERY SYSTEM (20 MIN CHECK) ---
-        const staleThreshold = new Date(Date.now() - 20 * 60 * 1000); 
-        const staleOrders = await Order.find({ status: 'ready', ready_at: { $lt: staleThreshold } });
-        
-        for (const order of staleOrders) {
-            const channel = await client.channels.fetch(order.channel_id).catch(() => null);
-            const proofList = order.images && order.images.length > 0 ? order.images.map((l, i) => `**Proof ${i+1}:** ${l}`).join('\n') : "No proofs attached.";
-
-            if (channel) {
-                const embed = createEmbed("📦 Order Delivered", 
-                    `Hello <@${order.user_id}>,\n\nYour order has been automatically processed for delivery to ensure timely service.\n\n**Order ID:** \`${order.order_id}\`\n**Item:** ${order.item}\n**Status:** Completed\n\n**Kitchen Proofs:**\n${proofList}\n\nThank you for choosing Sugar Rush.`,
-                    COLOR_SUCCESS
-                );
-                await channel.send({ content: `<@${order.user_id}>`, embeds: [embed] }).catch(() => {});
+            const threshold = new Date(Date.now() - 20 * 60 * 1000);
+            const stale = await Order.find({ status: 'ready', ready_at: { $lt: threshold } });
+            for (const order of stale) {
+                const channel = await client.channels.fetch(order.channel_id).catch(() => null);
+                if (channel) {
+                    const proofs = order.images?.length ? order.images.map((l, i) => `**Proof ${i+1}:** ${l}`).join('\n') : "None.";
+                    const embed = createEmbed("📦 Order Delivered", `Hello <@${order.user_id}>,\n\nAuto-processed for timely service.\n\n**ID:** \`${order.order_id}\`\n**Item:** ${order.item}\n**Proofs:**\n${proofs}`, COLOR_SUCCESS);
+                    await channel.send({ content: `<@${order.user_id}>`, embeds: [embed] }).catch(() => {});
+                }
+                order.status = 'delivered'; order.deliverer_id = 'SYSTEM'; await order.save();
             }
-            order.status = 'delivered';
-            order.deliverer_id = 'SYSTEM';
-            await order.save();
-        }
-    } catch (e) { 
-        console.error("Maintenance Loop Error:", e); 
-    }
-
-}, 60000); 
+        } catch (e) { console.error(e); }
+    }, 60000);
+});
 
 client.login(CONF_TOKEN);
