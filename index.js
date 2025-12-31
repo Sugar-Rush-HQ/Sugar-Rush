@@ -618,7 +618,6 @@ client.on('ready', async () => {
                 { name: `Total Servers: ${serverCount}`, type: ActivityType.Watching },
                 { name: `/order | Sugar Rush`, type: ActivityType.Playing },
                 { name: `Users: ${totalUsers}`, type: ActivityType.Watching },
-                { name: `${pendingCount} orders in queue`, type: ActivityType.Watching }
             ];
 
             client.user.setPresence({ activities: [statuses[statusIndex]], status: 'online' });
