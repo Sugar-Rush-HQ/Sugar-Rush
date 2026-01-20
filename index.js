@@ -2,9 +2,9 @@
  * ============================================================================
  * SUGAR RUSH - MASTER DISCORD AUTOMATION INFRASTRUCTURE
  * ============================================================================
- * * VERSION: 82.6.19 (ORIGIN TRACKING UPDATE)
+ * * VERSION: 82.6.32 (REMOVED PUBLIC NSFW TERMS)
  * * ----------------------------------------------------------------------------
- * 📜 FULL COMMAND REGISTER (35 TOTAL COMMANDS):
+ * 📜 FULL COMMAND REGISTER (38 TOTAL COMMANDS):
  * [MAINTAINED EXACTLY AS ORIGINAL]
  * ============================================================================
  */
@@ -47,6 +47,7 @@ const ROLE_COOK = '1454877400729911509';
 const ROLE_DELIVERY = '1454877287953469632';
 const ROLE_MANAGER = '1454876343878549630';
 const ROLE_QUOTA_EXEMPT = '1454936082591252534';
+const ROLE_PR_LEAD = process.env.ROLE_PR_LEAD; 
 
 // QUOTA RANKS
 const ROLE_TRAINEE_COOK = '1454877490156671090';
@@ -68,6 +69,7 @@ const COLOR_MAIN = 0xFFA500;
 const COLOR_VIP = 0xF1C40F;     
 const COLOR_FAIL = 0xFF0000;    
 const COLOR_SUCCESS = 0x2ECC71; 
+const COLOR_PARTNER = 0xFF69B4; 
 
 // ============================================================================
 // [2] DATABASE SCHEMAS
@@ -93,13 +95,14 @@ const OrderSchema = new mongoose.Schema({
     order_id: String,
     user_id: String,
     guild_id: String,
-    guild_name: String,   // [NEW]
+    guild_name: String,   
     channel_id: String,
-    channel_name: String, // [NEW]
+    channel_name: String, 
     status: { type: String, default: 'pending' }, 
     item: String,
     is_vip: { type: Boolean, default: false },
     is_super: { type: Boolean, default: false },
+    is_partner_order: { type: Boolean, default: false }, 
     created_at: { type: Date, default: Date.now },
     chef_name: String,
     chef_id: String,
@@ -119,6 +122,7 @@ const Order = mongoose.model('Order', OrderSchema);
 const VIPCode = mongoose.model('VIPCode', new mongoose.Schema({ code: { type: String, unique: true }, is_used: { type: Boolean, default: false } }));
 const Script = mongoose.model('Script', new mongoose.Schema({ user_id: String, script: String }));
 const ServerBlacklist = mongoose.model('ServerBlacklist', new mongoose.Schema({ guild_id: String, reason: String, authorized_by: String }));
+const PartnerServer = mongoose.model('PartnerServer', new mongoose.Schema({ guild_id: String, added_by: String, date: { type: Date, default: Date.now } })); 
 const SystemConfig = mongoose.model('SystemConfig', new mongoose.Schema({ id: { type: String, default: 'main' }, last_quota_run: { type: Date, default: new Date(0) } }));
 
 // ============================================================================
@@ -266,6 +270,7 @@ async function updateOrderArchive(orderId) {
         let color = COLOR_MAIN;
         if (order.is_super) color = COLOR_FAIL;
         else if (order.is_vip) color = COLOR_VIP;
+        if (order.is_partner_order) color = COLOR_PARTNER;
 
         const embed = createEmbed(`Archive: #${order.order_id}`, null, color, [
             { name: 'Status', value: `\`${order.status.toUpperCase()}\``, inline: true },
@@ -341,13 +346,25 @@ client.on('interactionCreate', async (interaction) => {
         // HELP
         if (commandName === 'help') {
             const fields = [
-                { name: "🛡️ Management", value: "`/generate_codes`, `/fdo`, `/force_warn`, `/run_quota`, `/ban`, `/unban`, `/refund`, `/serverblacklist`, `/unserverblacklist`" },
+                { name: "🛡️ Management", value: "`/partner_add`, `/partner_remove`, `/generate_codes`, `/fdo`, `/force_warn`, `/run_quota`, `/ban`, `/unban`, `/refund`, `/serverblacklist`" },
                 { name: "💰 Economy", value: "`/balance`, `/daily`, `/tip`, `/redeem`, `/premium`" },
                 { name: "📦 Ordering", value: "`/order`, `/super_order`, `/orderstatus`, `/orderinfo`, `/rate`, `/review`" },
                 { name: "👨‍🍳 Staff", value: "`/claim`, `/cook`, `/orderlist`, `/deliver`, `/deliverylist`, `/setscript`, `/stats`, `/vacation`, `/staff_buy`" },
-                { name: "🔗 Utility", value: "`/help`, `/invite`, `/support`, `/rules`, `/warn`" }
+                { name: "🔗 Utility", value: "`/partners`, `/help`, `/invite`, `/support`, `/rules`, `/warn`" }
             ];
             return interaction.reply({ embeds: [createEmbed("📖 Sugar Rush Directory", "Complete Protocol", COLOR_MAIN, fields)] });
+        }
+
+        if (commandName === 'partner_add') {
+            if (!interaction.member.roles.cache.has(ROLE_PR_LEAD)) return interaction.reply({ embeds: [createEmbed("❌ Denied", "Public Relations Lead Only.", COLOR_FAIL)], ephemeral: true });
+            await PartnerServer.findOneAndUpdate({ guild_id: options.getString('id') }, { added_by: interaction.user.id }, { upsert: true });
+            return interaction.reply({ embeds: [createEmbed("🎉 Partner Added", `Server ID: ${options.getString('id')} is now a verified partner. Orders here will be FREE.`, COLOR_PARTNER)] });
+        }
+
+        if (commandName === 'partner_remove') {
+            if (!interaction.member.roles.cache.has(ROLE_PR_LEAD)) return interaction.reply({ embeds: [createEmbed("❌ Denied", "Public Relations Lead Only.", COLOR_FAIL)], ephemeral: true });
+            await PartnerServer.deleteOne({ guild_id: options.getString('id') });
+            return interaction.reply({ embeds: [createEmbed("💔 Partner Removed", `Server ID: ${options.getString('id')} removed from registry.`, COLOR_FAIL)] });
         }
 
         if (commandName === 'generate_codes') {
@@ -448,6 +465,15 @@ client.on('interactionCreate', async (interaction) => {
             let cost = commandName === 'super_order' ? 150 : 100;
             if (isVip) cost = Math.ceil(cost * 0.5); // VIP Discount
 
+            // [NEW] CHECK FOR PARTNER SERVER
+            const isPartner = await PartnerServer.findOne({ guild_id: interaction.guildId });
+            let isPartnerOrder = false;
+            
+            if (isPartner) {
+                cost = 0; // FREE!
+                isPartnerOrder = true;
+            }
+
             // [NEW] OVERFLOW PROTECTION WITH PAID BYPASS
             const queueCount = await Order.countDocuments({ status: 'pending' });
             const MAX_QUEUE = 30;
@@ -528,12 +554,13 @@ client.on('interactionCreate', async (interaction) => {
                                 order_id: oid, 
                                 user_id: interaction.user.id, 
                                 guild_id: interaction.guildId, 
-                                guild_name: interaction.guild.name, // [ADDED]
+                                guild_name: interaction.guild.name,
                                 channel_id: interaction.channelId, 
-                                channel_name: interaction.channel.name, // [ADDED]
+                                channel_name: interaction.channel.name,
                                 item: options.getString('item'), 
                                 is_vip: isVip, 
                                 is_super: commandName === 'super_order', 
+                                is_partner_order: isPartnerOrder, 
                                 kitchen_msg_id: kitchenMsgId 
                             }).save();
                             updateOrderArchive(oid);
@@ -569,17 +596,24 @@ client.on('interactionCreate', async (interaction) => {
                 order_id: oid, 
                 user_id: interaction.user.id, 
                 guild_id: interaction.guildId, 
-                guild_name: interaction.guild.name, // [ADDED]
+                guild_name: interaction.guild.name, 
                 channel_id: interaction.channelId, 
-                channel_name: interaction.channel.name, // [ADDED]
+                channel_name: interaction.channel.name, 
                 item: options.getString('item'), 
                 is_vip: isVip, 
-                is_super: commandName === 'super_order', 
+                is_super: commandName === 'super_order',
+                is_partner_order: isPartnerOrder, 
                 kitchen_msg_id: kitchenMsgId 
             }).save();
             userData.balance -= cost; await userData.save();
             updateOrderArchive(oid);
-            return interaction.reply({ embeds: [createEmbed("✅ Authorized", "Sent to kitchen.", COLOR_SUCCESS)] });
+            
+            // [UPDATED] Partner Order Confirmation Message
+            if (isPartnerOrder) {
+                return interaction.reply({ embeds: [createEmbed("🎉 Partner Order (FREE)", `Thank you for ordering in **${interaction.guild.name}**, one of our verified partners!\nYour order has been sent to the kitchen at **no cost**.`, COLOR_PARTNER)] });
+            } else {
+                return interaction.reply({ embeds: [createEmbed("✅ Authorized", "Sent to kitchen.", COLOR_SUCCESS)] });
+            }
         }
 
         if (commandName === 'orderstatus') {
@@ -610,7 +644,12 @@ client.on('interactionCreate', async (interaction) => {
             const o = await Order.findOne({ order_id: options.getString('id'), status: 'pending' });
             if (!o) return interaction.reply({ embeds: [createEmbed("❌ Error", "Invalid ID.", COLOR_FAIL)] });
             o.status = 'claimed'; o.chef_id = interaction.user.id; o.chef_name = interaction.user.username; await o.save();
-            client.users.fetch(o.user_id).then(u => u.send({ embeds: [createEmbed("👨‍🍳 Order Claimed", `Your order \`${o.order_id}\` has been claimed by **${interaction.user.username}**.`, COLOR_SUCCESS)] }).catch(() => {}));
+            
+            // [MODIFIED] Silent Claim for Standard Users. Only VIP/Partner/Super get DMs here.
+            if (o.is_vip || o.is_partner_order || o.is_super) {
+                client.users.fetch(o.user_id).then(u => u.send({ embeds: [createEmbed("👨‍🍳 Order Claimed", `Your order \`${o.order_id}\` has been claimed by **${interaction.user.username}**.`, COLOR_SUCCESS)] }).catch(() => {}));
+            }
+
             updateOrderArchive(o.order_id); 
             setTimeout(async () => {
                 const check = await Order.findOne({ order_id: o.order_id });
@@ -629,14 +668,28 @@ client.on('interactionCreate', async (interaction) => {
             if (options.getAttachment('image3')) proofs.push(options.getAttachment('image3').url);
             o.status = 'cooking'; o.images = proofs; await o.save();
             updateOrderArchive(o.order_id); 
+            
+            // [RETAINED] Everyone gets the "In Oven" notification
             client.users.fetch(o.user_id).then(u => u.send({ embeds: [createEmbed("♨️ Cooking", `Your order \`${o.order_id}\` is now being cooked!`, COLOR_MAIN)] }).catch(() => {}));
+            
+            let cookTime = 180000; 
+            if (o.is_vip || o.is_partner_order) {
+                cookTime = 60000; 
+            }
+
             setTimeout(async () => {
                 await Order.findOneAndUpdate({ order_id: o.order_id }, { status: 'ready', ready_at: new Date() });
                 updateOrderArchive(o.order_id); 
-                // [UPDATED] Delivery notification includes Server/Channel
                 client.channels.cache.get(CHAN_DELIVERY).send({ embeds: [createEmbed("🥡 Order Ready", `**ID:** ${o.order_id}\n**Customer:** <@${o.user_id}>\n**Server:** ${o.guild_name}\n**Channel:** #${o.channel_name}`)] });
-            }, 180000);
-            return interaction.reply({ embeds: [createEmbed("♨️ Cooking", `Started timer (3m). Proofs: ${proofs.length}`)] });
+                
+                // [NEW] VIP/Partner/Super Notification for "Ready" + Delivery Promise
+                if (o.is_vip || o.is_partner_order || o.is_super) {
+                     client.users.fetch(o.user_id).then(u => u.send({ embeds: [createEmbed("✅ Order Ready", `**Your order is fully cooked and waiting in the Delivery Room.**\n\n⏱️ **Promise:** A driver will deliver this shortly.\nIf no driver is available, our **Auto-System will deliver it within the hour.**`, COLOR_SUCCESS)] }).catch(() => {}));
+                }
+
+            }, cookTime);
+
+            return interaction.reply({ embeds: [createEmbed("♨️ Cooking", `Started timer (${cookTime / 60000}m). Proofs: ${proofs.length}`)] });
         }
 
         if (commandName === 'deliver') {
@@ -662,7 +715,32 @@ client.on('interactionCreate', async (interaction) => {
                 }, 300000);
 
                 return interaction.reply({ embeds: [createEmbed("📫 Dispatch", "Sent to DMs.", COLOR_SUCCESS)] });
-            } catch (e) { return interaction.reply({ embeds: [createEmbed("❌ Failed", "Invite blocked. Ready for Auto-System.", COLOR_FAIL)] }); }
+            } catch (e) {
+                // [UPDATED] BRANDED PROFESSIONAL AUTO-DELIVERY ON INVITE FAILURE
+                const channel = await client.channels.fetch(o.channel_id).catch(() => null);
+                if (channel) {
+                    let proofsText = "None.";
+                    if (o.images?.length > 0) {
+                        proofsText = o.images.map((l, i) => `**Proof ${i+1}:** [View Image](${l})`).join('\n');
+                    }
+                    const embed = createEmbed("📦 Order Delivered", 
+                        `Hello <@${o.user_id}>,\n\n` +
+                        `Thank you for ordering with **Sugar Rush**!\n\n` +
+                        `Our logistics team attempted to hand-deliver your order, but we were unable to generate a valid invite to your server. ` +
+                        `To ensure you don't wait any longer, your package has been routed through our **Automated Express Dispatch**.\n\n` +
+                        `**Order ID:** \`${o.order_id}\`\n` +
+                        `**Item:** ${o.item}\n` +
+                        `**Proofs:**\n${proofsText}`, 
+                        COLOR_SUCCESS);
+                    if (o.images && o.images.length > 0) {
+                        embed.setImage(o.images[0]);
+                    }
+                    await channel.send({ content: `<@${o.user_id}>`, embeds: [embed] }).catch(() => {});
+                }
+                o.status = 'delivered'; o.deliverer_id = 'SYSTEM'; await o.save();
+                updateOrderArchive(o.order_id); 
+                return interaction.reply({ embeds: [createEmbed("🤖 Auto-Delivered", "Invite creation failed. Order delivered automatically via bot.", COLOR_SUCCESS)] });
+            }
         }
 
         if (commandName === 'orderlist') {
@@ -709,6 +787,32 @@ client.on('interactionCreate', async (interaction) => {
             return interaction.reply({ embeds: [createEmbed("📖 Rules", rulesText)] });
         }
         
+        if (commandName === 'partners') {
+            const count = await PartnerServer.countDocuments();
+            const embed = createEmbed("🤝 Sugar Rush Partnerships", 
+                "Partnering with Sugar Rush brings sweet benefits to your community!\n\n" +
+                "**💎 Verified Partner Perks:**\n" +
+                "• **Free Economy:** All orders placed within Partner Servers are **100% FREE**.\n" +
+                "• **Priority Support:** Direct line to our logistics team.\n" +
+                "• **Marketing Boost:** We will list an Advertisement for your community in our Partners channel (with `@everyone`) and forward select announcements (Conditions apply).\n" +
+                "• **Community Events:** Cross-server events and giveaways.\n\n" +
+                `**🌐 Current Partners:** ${count} Servers\n\n` +
+                "**📩 How to Apply:**\n" +
+                "**This is the primary way to join.** Contact our **Public Relations Lead** or open a ticket in our Support Server to discuss partnership opportunities.\n\n" +
+                "▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n\n" +
+                "**🏆 Patreon Partnership Tier**\n" +
+                "For communities that do not meet our activity requirements, or simply wish to support the project financially, we offer a dedicated Paid Tier.\n\n" +
+                "**🎁 Owner Benefits:**\n" +
+                "• Receive **5x VIP Codes (30-Day)** every single month to distribute to your members.\n" +
+                "• **Rollover Policy:** Missed a month? You can claim the previous month too (Max **10 codes** per claim).\n" +
+                "• **How to Claim:** Open a ticket in our Support Server each month to receive your code batch.\n\n" +
+                `**[👉 Click here to view Patreon Tiers](${CONF_STORE})**\n\n` +
+                "⚠️ **Notice:** Sugar Rush Operations reserves the right to revoke Partnership status or VIP privileges at any time for violations of our terms.",
+                COLOR_PARTNER
+            );
+            return interaction.reply({ embeds: [embed] });
+        }
+
         if (commandName === 'run_quota') { if (!interaction.member.roles.cache.has(ROLE_MANAGER)) return interaction.reply({ embeds: [createEmbed("❌ Denied", "Unauthorized.", COLOR_FAIL)] }); await executeQuotaRun(); return interaction.reply({ embeds: [createEmbed("✅ Audit", "Audit complete.", COLOR_SUCCESS)] }); }
 
     } catch (e) { 
@@ -730,6 +834,8 @@ client.on('ready', async () => {
     postTopGGStats(client.guilds.cache.size, client.user.id);
     
     const commands = [
+        { name: 'partner_add', description: 'Authorize Partner Server', options: [{ name: 'id', type: 3, description: 'Guild ID', required: true }] },
+        { name: 'partner_remove', description: 'Revoke Partner Server', options: [{ name: 'id', type: 3, description: 'Guild ID', required: true }] },
         { name: 'generate_codes', description: 'Generate VIP codes', options: [{ name: 'amount', type: 4, description: 'Amount', required: true }] },
         { name: 'serverblacklist', description: 'Blacklist a server', options: [{ name: 'id', type: 3, description: 'Guild ID', required: true }, { name: 'reason', type: 3, description: 'Reason', required: true }] },
         { name: 'unserverblacklist', description: 'Unblacklist a server', options: [{ name: 'id', type: 3, description: 'Guild ID', required: true }] },
@@ -763,6 +869,7 @@ client.on('ready', async () => {
         { name: 'staff_buy', description: 'Buy buff' },
         { name: 'invite', description: 'Get invite' },
         { name: 'support', description: 'Get support' },
+        { name: 'partners', description: 'View partnership info' },
         { name: 'rules', description: 'Get rules' },
         { name: 'help', description: 'Get help directory' }
     ];
@@ -791,7 +898,9 @@ client.on('ready', async () => {
                 topggTick = 0;
             }
 
-            const threshold = new Date(Date.now() - 20 * 60 * 1000);
+            // [UPDATED] Auto Delivery Threshold: 55 Minutes
+            const threshold = new Date(Date.now() - 55 * 60 * 1000);
+            
             const stale = await Order.find({ status: 'ready', ready_at: { $lt: threshold } });
             for (const order of stale) {
                 const channel = await client.channels.fetch(order.channel_id).catch(() => null);
